@@ -2,36 +2,36 @@
 import numpy as np
 
 # %%
-def p_endconsumers(E_wholesale_P, fixed_P_component):
+def p_endconsumers(avg_wholesale_price, fixed_price_component):
     """
         Return end consumer price
     
     Parameters
     ----------
-        E_wholesale_P : float
-            average wholesale market price ($/MWh)
-        fixed_P_component : float
+        avg_wholesale_price : float
+            average (quantity-weighted) wholesale market price ($/MWh)
+        fixed_price_component : float
             cost per unit of electricity that doesn't vary by wholesale price ($/MWh)
 
     Returns
     -------
-        end_P : float
+        end_price : float
             price consumer pays per unit of electricity
     """
     
-    end_P = E_wholesale_P + fixed_P_component
+    end_price = avg_wholesale_price + fixed_price_component
         
-    return end_P
+    return end_price
 
-def q_demanded(E_wholesale_P, fixed_P_component, price_elast, xi):
+def q_demanded(avg_wholesale_price, fixed_price_component, price_elast, xi):
     """
         Return quantity demanded
     
     Parameters
     ----------
-        E_wholesale_P : ndarray / float
-            average wholesale market price ($/MWh)
-        fixed_P_component : ndarray / float
+        avg_wholesale_price : ndarray / float
+            average (quantity-weighted) wholesale market price ($/MWh)
+        fixed_price_component : ndarray / float
             cost per unit of electricity that doesn't vary by wholesale price ($/MWh)
         price_elast : float
             price elasticity
@@ -44,36 +44,57 @@ def q_demanded(E_wholesale_P, fixed_P_component, price_elast, xi):
             quantity demanded
     """
     
-    end_P = p_endconsumers(E_wholesale_P, fixed_P_component)
-    q = (xi / end_P)**price_elast
+    end_price = p_endconsumers(avg_wholesale_price, fixed_price_component)
+    q = xi / end_price**price_elast
         
     return q
 
-def u(E_wholesale_P, fixed_P_component, price_elast, xi, q):
+def q_demanded_inv(end_price, price_elast, q):
     """
-        Return utility of consumption
+        Return inverse of quantity demanded
     
     Parameters
     ----------
-        E_wholesale_P : ndarray / float
-            average wholesale market price ($/MWh)
-        fixed_P_component : ndarray / float
+        end_price : ndarray / float
+            price end-consumers pay for electricity ($/MWh)
+        price_elast : float
+            price elasticity
+        q : ndarray / float
+            quantity demanded
+
+    Returns
+    -------
+        xi : ndarray / float
+            demand shocks
+    """
+    
+    xi = end_price**price_elast * q
+        
+    return xi
+
+def cs(avg_wholesale_price, fixed_price_component, price_elast, xi):
+    """
+        Return the consumer surplus from consumption
+    
+    Parameters
+    ----------
+        avg_wholesale_price : ndarray / float
+            average (quantity-weighted) wholesale market price ($/MWh)
+        fixed_price_component : ndarray / float
             cost per unit of electricity that doesn't vary by wholesale price ($/MWh)
         price_elast : float
             price elasticity
         xi : ndarray / float
             demand shocks
-        q : ndarray / float
-            quantity demanded (in MWh)
             
 
     Returns
     -------
-        q : ndarray / float
-            quantity demanded
+        u : ndarray / float
+            consumer surplus
     """
     
-    end_P = p_endconsumers(E_wholesale_P, fixed_P_component)
-    u = xi / (1.0 - 1.0 / price_elast) * q**(1.0 - 1.0 / price_elast) - end_P * q
+    end_price = p_endconsumers(avg_wholesale_price, fixed_price_component)
+    u = xi * end_price**(1.0 - price_elast) * 1.0 / (price_elast - 1.0)
         
     return u
