@@ -3,28 +3,22 @@
 import sys
 from itertools import product
 
-from multiprocessing import Pool
-
 import time as time
+from datetime import datetime
 
 import numpy as np
 import scipy.stats as stats
 import pandas as pd
 
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import check_random_state
+
+from scipy.spatial.distance import cdist
+
 import global_vars as gv
 import wholesale.wholesale_profits as eqm
 import wholesale.capacity_commitment as cc
 import wholesale.demand as demand
-
-# %%
-# Parameters for generating wholesale profits
-num_draws = 1000
-running_specification = int(sys.argv[1])
-num_cpus = int(sys.argv[2])
-print(f"num_cpus: {num_cpus}", flush=True)
-generator_groupings = gv.generator_groupings
-generators_use = np.concatenate(tuple([value for key, value in generator_groupings.items()]))
-groupings_use = np.concatenate(tuple([np.array([key]) for key, value in generator_groupings.items()]))
 
 # %%
 # Import data and wholesale market production cost estimates
@@ -43,6 +37,7 @@ loaded = np.load(gv.energy_gen_file)
 energy_gen = np.copy(loaded['arr_0'])
 loaded.close()
 prices = np.load(gv.prices_realtime_file) # np.load(gv.prices_file)
+dsp_quantities = np.load(gv.dsp_quantities_file)
 load_curtailed = np.load(gv.load_curtailment_file)
 tariffs = np.load(gv.residential_tariff_file)
 carbon_taxes = np.load(gv.carbon_taxes_file)
@@ -63,13 +58,86 @@ cap_date_until = np.load(gv.cap_date_until_file)
 print(f"Finished importing data.", flush=True)
 
 # Demand elasticity estimate
-demand_elasticity = np.load(gv.arrays_path + "demand_elasticity_estimates.npy")[-1] # we want the last specification
+demand_elasticity = np.load(gv.arrays_path + "demand_elasticity_estimates.npy")[-2] # we want the second-to-last specification
 print(f"Finished import demand elasticity estimates.", flush=True)
 
 # Production cost shock estimates
 production_cost_est = np.load(gv.arrays_path + "production_cost_estimates.npy")
 production_cost_est_sources = np.load(gv.arrays_path + "production_cost_estimates_sources.npy")
 print(f"Finished importing production cost estimates.", flush=True)
+
+# Battery parameters
+battery_capacity = 2000.0 # total capacity
+battery_flow = 1.0 / 8.0 * battery_capacity # how much can be charged/discharged within a half-hour (4-hour battery)
+battery_delta = 0.9
+
+# %%
+# Save parameters
+
+def create_file(file_name, file_contents):
+    f = open(file_name, "w")
+    f.write(file_contents)
+    f.close()
+
+# %%
+# Set up parameters used throughout code
+
+# Obtain SLURM array number
+slurm_array_num = int(sys.argv[1])
+
+# Parameters for generating wholesale profits
+num_draws = 10
+sample_length = 60
+drop_before = 5
+drop_after = 5
+carbon_taxes_linspace = np.linspace(0.0, 300.0, 7) # this is in AUD / ton CO2, need to put it in / kgCO2 later when use in equilibrium calculation
+renewable_subsidies_linspace = np.linspace(0.0, 150.0, 7) # this is in AUD / MWh
+capacity_payments_linspace = np.linspace(0.0, 200000.0, 5)
+capacity_payments_linspace_extended = np.linspace(0.0, 250000.0, 6)
+years_list = np.unique(pd.to_datetime(dates).year)
+num_years_in_year_grouping = 4
+num_year_groupings = int(np.floor(years_list.shape[0] / num_years_in_year_grouping))
+if slurm_array_num == 0:
+    np.save(f"{gv.arrays_path}counterfactual_carbon_taxes_linspace.npy", carbon_taxes_linspace)
+    np.save(f"{gv.arrays_path}counterfactual_renewable_subsidies_linspace.npy", renewable_subsidies_linspace)
+    np.save(f"{gv.arrays_path}counterfactual_capacity_payments_linspace.npy", capacity_payments_linspace)
+    np.save(f"{gv.arrays_path}counterfactual_capacity_payments_linspace_extended.npy", capacity_payments_linspace_extended)
+    np.save(f"{gv.arrays_path}years_list.npy", years_list)
+    np.save(f"{gv.arrays_path}num_years_in_year_grouping.npy", np.array([num_years_in_year_grouping]))
+    create_file(f"{gv.stats_path}battery_flow.tex", f"{(battery_flow * 2):.0f}") # *2 since it's half-hour capacity/flow
+    create_file(f"{gv.stats_path}battery_capacity.tex", f"{(battery_capacity * 2):.0f}")
+    create_file(f"{gv.stats_path}battery_delta.tex", f"{(battery_delta * 100.0):.0f}")
+
+# Convert SLURM array number to specification being run
+specification_list_slurm_arrays = np.array([0] * num_year_groupings + [1] * num_year_groupings * carbon_taxes_linspace.shape[0] + [2] * num_year_groupings * renewable_subsidies_linspace.shape[0] + [3] * num_year_groupings * carbon_taxes_linspace.shape[0] + [4] * num_year_groupings * carbon_taxes_linspace.shape[0] + [5])
+policy_list_slurm_arrays = np.concatenate(([0] * num_year_groupings, np.tile(np.arange(carbon_taxes_linspace.shape[0]), num_year_groupings), np.tile(np.arange(renewable_subsidies_linspace.shape[0]), num_year_groupings), np.tile(np.arange(carbon_taxes_linspace.shape[0]), num_year_groupings), np.tile(np.arange(carbon_taxes_linspace.shape[0]), num_year_groupings), [0]))
+year_list_slurm_arrays = np.concatenate((np.tile(np.arange(num_year_groupings), 1 + carbon_taxes_linspace.shape[0] + renewable_subsidies_linspace.shape[0] + carbon_taxes_linspace.shape[0] + carbon_taxes_linspace.shape[0]), np.zeros(1, dtype=int)))
+num_computation_groups_per_specification = 16
+computation_group_list_slurm_arrays = np.arange(num_computation_groups_per_specification)
+computation_group_list_slurm_arrays = np.tile(computation_group_list_slurm_arrays, (specification_list_slurm_arrays.shape[0],))
+specification_list_slurm_arrays = np.repeat(specification_list_slurm_arrays, num_computation_groups_per_specification)
+policy_list_slurm_arrays = np.repeat(policy_list_slurm_arrays, num_computation_groups_per_specification)
+year_list_slurm_arrays = np.repeat(year_list_slurm_arrays, num_computation_groups_per_specification)
+
+# Remove renewable subsidy for which subsidy is 0 b/c same as carbon tax is 0
+renewable_subsidy_0 = (specification_list_slurm_arrays == 2) & (policy_list_slurm_arrays == 0)
+specification_list_slurm_arrays = specification_list_slurm_arrays[~renewable_subsidy_0]
+policy_list_slurm_arrays = policy_list_slurm_arrays[~renewable_subsidy_0]
+year_list_slurm_arrays = year_list_slurm_arrays[~renewable_subsidy_0]
+computation_group_list_slurm_arrays = computation_group_list_slurm_arrays[~renewable_subsidy_0]
+
+# Determine specifications
+if slurm_array_num == 0:
+    np.save(f"{gv.arrays_path}specification_list_slurm_arrays.npy", specification_list_slurm_arrays)
+    np.save(f"{gv.arrays_path}policy_list_slurm_arrays.npy", policy_list_slurm_arrays)
+    np.save(f"{gv.arrays_path}year_list_slurm_arrays.npy", year_list_slurm_arrays)
+    np.save(f"{gv.arrays_path}computation_group_list_slurm_arrays.npy", computation_group_list_slurm_arrays)
+running_specification, policy_specification, year_specification, computation_group_specification = specification_list_slurm_arrays[slurm_array_num], policy_list_slurm_arrays[slurm_array_num], year_list_slurm_arrays[slurm_array_num], computation_group_list_slurm_arrays[slurm_array_num]
+
+# Generator specifications
+generator_groupings = gv.generator_groupings
+generators_use = np.concatenate(tuple([value for key, value in generator_groupings.items()]))
+groupings_use = np.concatenate(tuple([np.array([key]) for key, value in generator_groupings.items()]))
 
 # %%
 # Calibrate fixed price component so residential tariffs = predicted prices
@@ -118,6 +186,7 @@ num_intervals_in_day = energy_gen.shape[2]
 dates = np.repeat(dates, num_intervals_in_day)
 energy_gen = np.reshape(energy_gen, (facilities.shape[0], -1))
 prices = np.reshape(prices, (-1,))
+dsp_quantities = np.repeat(dsp_quantities, num_intervals_in_day)
 load_curtailed = np.reshape(load_curtailed, (-1,))
 tariffs = np.repeat(tariffs, num_intervals_in_day)
 carbon_taxes = np.repeat(carbon_taxes, num_intervals_in_day)
@@ -136,6 +205,13 @@ total_load_all = total_load_all - np.nansum(energy_gen[~np.isin(facilities, gene
 
 # What fraction is not included?
 print(f"Fraction not included: {np.round((np.nansum(energy_gen[~np.isin(facilities, generators_use),:]) / np.nansum(energy_gen)) * 100.0, 2)}%.", flush=True)
+if slurm_array_num == 0:
+    # Fraction of production
+    create_file(gv.stats_path + "frac_drop_gen_size_threshold.tex", f"{np.round((np.nansum(energy_gen[~np.isin(facilities, generators_use),:]) / np.nansum(energy_gen)) * 100.0, 2)}%")
+    
+    # Fraction of capacity
+    ff = np.isin(energy_sources, np.concatenate((gv.natural_gas, np.array([gv.coal]))))
+    create_file(gv.stats_path + "frac_drop_gen_cap_size_threshold.tex", f"{np.round((np.nansum(capacities[~np.isin(facilities, generators_use) & ff]) / np.nansum(capacities[ff])) * 100.0, 2)}%")
 
 # Remove the facilities not in gv.use_sources
 facilities_orig = np.copy(facilities)
@@ -243,8 +319,13 @@ print(f"Reversed order of dimensions along which we subtract.", flush=True)
 
 capacities_add = {
     gv.gas_ccgt: 400.0, 
-    gv.solar: 400.0, 
-    gv.wind: 400.0
+    gv.solar: 200.0, 
+    gv.wind: 200.0
+}
+num_gens_add = {
+    gv.gas_ccgt: 1, 
+    gv.solar: 2, 
+    gv.wind: 2
 }
 energy_sources_add = {
     gv.gas_ccgt: gv.gas_ccgt, 
@@ -261,13 +342,8 @@ co2_rates_add = {
     gv.solar: 0.0, 
     gv.wind: 0.0
 }
-
-def create_file(file_name, file_contents):
-    f = open(file_name, "w")
-    f.write(file_contents)
-    f.close()
     
-if running_specification == 0:
+if slurm_array_num == 0:
     create_file(f"{gv.stats_path}capacity_new_ccgt.tex", f"{capacities_add[gv.gas_ccgt]:.0f}")
     create_file(f"{gv.stats_path}capacity_new_solar.tex", f"{capacities_add[gv.solar]:.0f}")
     create_file(f"{gv.stats_path}capacity_new_wind.tex", f"{capacities_add[gv.wind]:.0f}")
@@ -277,6 +353,14 @@ if running_specification == 0:
 new_sources = np.array([new_ccgt, new_wind, new_solar])
 for key, value in states_by_dim.items():
     if len(value) > 1:
+        # Change the number of generators based on num_gens_add
+        for i in range(len(value)):
+            num_repeats = np.ones(value[i].shape, dtype=int)
+            for source_ in new_sources:
+                num_repeats[np.isin(value[i], source_)] = num_gens_add[source_]
+            value[i] = np.repeat(value[i], num_repeats)
+
+        # Replace the generators with new names
         num_new = np.sum(np.isin(value[-1], new_sources))
         firm = key.split(",")[0]
         if num_new > 0:
@@ -301,6 +385,7 @@ energy_sources_list = np.unique(energy_sources)
 
 # Rename competitive participants to treat each grouping of generators separately
 participants = list(participants) # do list instead of array b/c o/w will cut off end of strings, convert later
+participants_alt = [p for p in participants] # save extra version of this array, which will use for all competitive version
 for i in range(facilities.shape[0]):
     if participants[i] == "c":
         generator_grouping_name = "c_"
@@ -313,6 +398,19 @@ for i in range(facilities.shape[0]):
             generator_grouping_name = generator_grouping_name + facilities[i] # this works b/c all the new ones are their own grouping
         participants[i] = generator_grouping_name
 participants = np.array(participants) # convert back to array
+
+# Rename all participants to be competitive for alternative formulation in which every generator grouping a separate firm
+for i in range(facilities.shape[0]):
+    generator_grouping_name = "c_"
+    found_in_grouping = False
+    for key, value in generator_groupings.items():
+        if np.isin(facilities[i], generator_groupings[key]):
+            generator_grouping_name = generator_grouping_name + key
+            found_in_grouping = True
+    if not found_in_grouping: # this means it's one of the new generators
+        generator_grouping_name = generator_grouping_name + facilities[i] # this works b/c all the new ones are their own grouping
+    participants_alt[i] = generator_grouping_name
+participants_alt = np.array(participants_alt) # convert back to array
 
 # %%
 # Construct array of state
@@ -348,15 +446,15 @@ for f, firm in enumerate(list_firms_state):
         dim_4_expand = num_firms * num_sources - dim_2_expand - 1 # this is the number of dimensions to expand of firm-sources that go after this dimension
         array_reshape_shape = tuple([dim_1] + [1 for i in range(dim_2_expand)] + [dim_3] + [1 for i in range(dim_4_expand)]) # tuple with new shape that incorporates correct expanded dimensions
         array_state_in = array_state_in * np.reshape(states_by_dim_inout[f"{firm},{source}"], array_reshape_shape) # multiply the broadcasted array
-        
+
 # %%
 # Create table that describes the choice set / state space
 
 # Begin table
 tex_table = f""
-tex_table += f"\\begin{{tabular}}{{ lllclc }} \n"
-tex_table += f" & & \multicolumn{{1}}{{c}}{{Expand}} / & & & \multicolumn{{1}}{{c}}{{Total}} \\\\ \n"
-tex_table += f"\multicolumn{{1}}{{c}}{{Firm}} & \multicolumn{{1}}{{c}}{{Technology}} & \multicolumn{{1}}{{c}}{{Retire}} & \multicolumn{{1}}{{c}}{{State}} & \multicolumn{{1}}{{c}}{{Generators}} & \multicolumn{{1}}{{c}}{{Capacity (MW)}} \\\\ \n \hline \n"
+tex_table += f"\\begin{{tabular}}{{ llclc }} \n"
+tex_table += f" & & & & \\multicolumn{{1}}{{c}}{{Total}} \\\\ \n"
+tex_table += f"\\multicolumn{{1}}{{c}}{{Firm}} & \\multicolumn{{1}}{{c}}{{Technology}} & \\multicolumn{{1}}{{c}}{{State}} & \\multicolumn{{1}}{{c}}{{Generators}} & \\multicolumn{{1}}{{c}}{{Capacity (MW)}} \\\\ \n \\hline \n"
 
 # Fill in table
 firm_bf = "" # string to compare firm name to, prevents listing firm name many times
@@ -368,6 +466,7 @@ for key, value in states_by_dim.items():
         
     # Determine firm name
     firm = key.split(",")[0]
+    firm_orig = firm
     if firm == firm_bf: # new firm
         firm = ""
     else:
@@ -385,19 +484,27 @@ for key, value in states_by_dim.items():
             expand_retire = "retire"
             expand_bool = False
             value = value[::-1]
-    if np.isin(technology, np.array(["gas_add", "gas_subtract"])):
-        technology = "gas"
-    tex_table += f"{technology} & {expand_retire} & "
+    if firm_orig != "WPGENER":
+        if np.isin(technology, np.array(["gas_add", "gas_subtract"])):
+            technology = "gas"
+    else:
+        if technology == "gas_add":
+            technology = "gas (modern)"
+        if technology == "gas_subtract":
+            technology = "gas (old)"
+    tex_table += f"{technology} & "
         
     prev_gens = np.array([], dtype="<U1")
     for i, list_generators in enumerate(value):
         
         # Add blanks for firm / technology if not first entry
         if i > 0:
-            tex_table += f" & & & "
-            
+            tex_table += f" & & "
+
         # Add what state we're in
-        tex_table += f"{i if expand_bool else len(value) - 1 - i} & "
+        tex_table += f"{i} & "
+        if i > 0:
+            tex_table += f"+ "
         
         # Add generators
         if list_generators.shape[0] == 0:
@@ -425,15 +532,19 @@ for key, value in states_by_dim.items():
 tex_table += f"\\hline \n \\end{{tabular}} \n"
     
 print(tex_table, flush=True)
-    
-if running_specification == 0:
+
+if slurm_array_num == 0:
     create_file(gv.tables_path + "choice_set.tex", tex_table)
 
 # %%
 # Save num draws stat
     
-if running_specification == 0:
+if slurm_array_num == 0:
     create_file(gv.stats_path + "wholesale_profits_num_draws.tex", f"{num_draws:,}".replace(",", "\\,"))
+    create_file(gv.stats_path + "wholesale_profits_sample_length.tex", f"{sample_length:,}".replace(",", "\\,"))
+    create_file(gv.stats_path + "wholesale_profits_drop_before.tex", f"{drop_before:,}".replace(",", "\\,"))
+    create_file(gv.stats_path + "wholesale_profits_drop_after.tex", f"{drop_after:,}".replace(",", "\\,"))
+    create_file(gv.stats_path + "wholesale_profits_effective_sample_length.tex", f"{(sample_length - drop_before - drop_after):,}".replace(",", "\\,"))
 
 # %%
 # Sample from distributions
@@ -441,163 +552,182 @@ if running_specification == 0:
 # Determine years
 years = pd.to_datetime(dates).year.values
 months = pd.to_datetime(dates).month.values
+days = pd.to_datetime(dates).day.values
 years[months < 10] = years[months < 10] - 1 # use the same year system as WEM, begins in October
-years_unique = np.unique(years)
+years_unique, years_unique_counts = np.unique(years, return_counts=True)
 num_years = years_unique.shape[0]
 
-# Create parameters of skew normal based on estimate array
-def corr_matrix(params):
-    k = int((1 + np.sqrt(8 * params.shape[0] + 1)) / 2)
-    z = np.tanh(params)
-    chol_factor = np.zeros((k, k))
-    chol_factor[0,0] = 1.0
-    z_ctr = 0
-    for i in range(1, k):
-        for j in range(k):
-            if j < i:
-                chol_factor[i,j] = z[z_ctr] * np.sqrt(1.0 - np.sum(chol_factor[i,:j]**2.0))
-                z_ctr += 1
-            elif j == i:
-                chol_factor[i,j] = np.sqrt(1.0 - np.sum(chol_factor[i,:j]**2.0))
-    matrix_R = chol_factor @ chol_factor.T
-    return matrix_R
-mu = production_cost_est[0:production_cost_est_sources.shape[0]]
-sigma = production_cost_est[production_cost_est_sources.shape[0]:(2*production_cost_est_sources.shape[0])]
-alpha = production_cost_est[(2*production_cost_est_sources.shape[0]):(3*production_cost_est_sources.shape[0])]
-corr_params = production_cost_est[(3*production_cost_est_sources.shape[0]):]
-matrix_R_expanded = corr_matrix(corr_params)
-matrix_R = matrix_R_expanded[1:,1:]
-for i in range(matrix_R.shape[0]):
-    matrix_R[i,i] = matrix_R_expanded[0,i+1]
+# Create production cost parameters based on estimate array
+ramping_costs = production_cost_est[0:production_cost_est_sources.shape[0]]
+mu = production_cost_est[production_cost_est_sources.shape[0]:(2*production_cost_est_sources.shape[0])]
+ramping_costs = np.concatenate((ramping_costs, np.zeros(gv.intermittent.shape[0])))
 mu = np.concatenate((mu, np.zeros(gv.intermittent.shape[0])))
-sigma = np.concatenate((sigma, np.zeros(gv.intermittent.shape[0])))
-alpha = np.concatenate((alpha, np.zeros(gv.intermittent.shape[0])))
-matrix_R = np.concatenate((matrix_R, np.zeros((matrix_R.shape[0], gv.intermittent.shape[0]))), axis=1)
-matrix_R = np.concatenate((matrix_R, np.zeros((gv.intermittent.shape[0], matrix_R.shape[1]))), axis=0)
+ramping_costs_gens = np.zeros(facilities.shape[0])
 mu_gens = np.zeros(facilities.shape[0])
-sigma_gens = np.zeros(facilities.shape[0])
-alpha_gens = np.zeros(facilities.shape[0])
-matrix_R_full = np.zeros((facilities.shape[0], facilities.shape[0]))
 for s, source in enumerate(np.concatenate((production_cost_est_sources, gv.intermittent))):
+    ramping_costs_gens += ramping_costs[s] * (energy_sources == source) / (capacities / 2.0) # scale by capacity
     mu_gens += mu[s] * (energy_sources == source)
-    sigma_gens += sigma[s] * (energy_sources == source)
-    alpha_gens += alpha[s] * (energy_sources == source)
-    for s_p, source_p in enumerate(np.concatenate((production_cost_est_sources, gv.intermittent))):
-        matrix_R_full[(energy_sources == source)[:,np.newaxis] & (energy_sources == source_p)[np.newaxis,:]] = matrix_R[s,s_p]
-for i in range(matrix_R_full.shape[0]):
-    matrix_R_full[i,i] = 1.0
 
-# Draw from skew normal based on estimates of distribution
-alpha_cov_alpha = alpha_gens @ matrix_R_full @ alpha_gens
-delta = (1.0 / np.sqrt(1.0 + alpha_cov_alpha)) * matrix_R_full @ alpha_gens
-covariance_addition = np.block([[np.ones(1), delta], [delta[:,np.newaxis], matrix_R_full]])
-covariance_addition_cholesky = np.linalg.cholesky(covariance_addition)
-x = stats.multivariate_normal.rvs(mean=np.zeros(energy_sources.shape[0] + 1), cov=np.identity(energy_sources.shape[0] + 1), size=num_draws) @ covariance_addition_cholesky.T
-x0, x1 = x[:,0], x[:,1:]
-x1 = (x0 > 0.0)[:,np.newaxis] * x1 - (x0 <= 0.0)[:,np.newaxis] * x1
-production_cost_shocks = x1.T * sigma_gens[:,np.newaxis] + mu_gens[:,np.newaxis]
-
-# Initialize arrays
-cap_factors = np.ones((capacities.shape[0], num_years, num_draws)) * np.nan
-production_costs = np.ones((capacities.shape[0], num_years, num_draws)) * np.nan
-demand_realizations = np.ones((num_years, num_draws)) * np.nan
-tariffs_sample = np.ones((num_years, num_draws)) * np.nan
-price_cap = np.ones((num_years, num_draws)) * np.nan
-carbon_taxes_rates = np.ones((num_years, num_draws)) * np.nan
-idx_all_obs = np.arange(years.shape[0])
-np.random.seed(1234567)
-for y, year in enumerate(years_unique):
-    sample_indices = np.random.choice(idx_all_obs[years == year], size=num_draws)
-    
-    # Demand
-    demand_realizations[y,:] = total_load_all[sample_indices]
-    
-    # Tariffs
-    tariffs_sample[y,:] = tariffs[sample_indices]
-    
-    # Price cap
-    price_cap[y,:] = max_prices[sample_indices]
-    
-    # Carbon tax rates
-    carbon_taxes_rates[y,:] = carbon_taxes[sample_indices]
-    
-    # Energy source-specific stuff:
-    for s, source in enumerate(np.unique(energy_sources)):
-        print(f"Computing {source} in year {year}.", flush=True)
-        select_source = energy_sources == source
-        num_source = np.sum(select_source)
-        # Capacity factors
-        cap_factor_source = cap_factor[source]
-        if np.all(np.isnan(cap_factor_source[:,sample_indices])): # if this source wasn't in the sample in this year
-            cap_factors[select_source,y,:] = np.nan # set to NaN, we will use the nearest year later
-        else:
-            for i in range(num_draws): # sample capacity factors from each date
-                min_idx_to_add = np.maximum(0, sample_indices[i] - 1)
-                max_idx_to_add = np.minimum(sample_indices[i], idx_all_obs[-1])
-                sample_idx_plus_bf_and_af = np.array([min_idx_to_add, sample_indices[i], max_idx_to_add]) # use the interval before and after as well to get sufficient number of observations
-                cap_factor_sample_plus_bf_and_af = cap_factor_source[:,sample_idx_plus_bf_and_af]
-                cap_factor_sample_plus_bf_and_af_notnan = ~np.isnan(cap_factor_sample_plus_bf_and_af)
-                num_obs_in_this_idx = np.sum(cap_factor_sample_plus_bf_and_af_notnan)
-                ctr = 0
-                while (num_obs_in_this_idx < num_source) and (ctr < 590): # if there are not enough in sample such that each could (in theory, but we sample w/ replacement) be sampled from a different value, expand until there are
-                    if (min_idx_to_add > 0) and (max_idx_to_add < idx_all_obs[-1]):
-                        min_idx_to_add = min_idx_to_add - 1
-                        max_idx_to_add = max_idx_to_add + 1
-                        sample_idx_plus_bf_and_af = np.concatenate((np.array([min_idx_to_add]), sample_idx_plus_bf_and_af, np.array([max_idx_to_add])))
-                    elif min_idx_to_add == 0: # can't have hit max in this case b/c there is a positive number of observations
-                        max_idx_to_add = max_idx_to_add + 1
-                        sample_idx_plus_bf_and_af = np.concatenate((sample_idx_plus_bf_and_af, np.array([max_idx_to_add])))
-                    elif max_idx_to_add == idx_all_obs[-1]:
-                        min_idx_to_add = min_idx_to_add - 1
-                        sample_idx_plus_bf_and_af = np.concatenate((np.array([min_idx_to_add]), sample_idx_plus_bf_and_af))
-                    cap_factor_sample_plus_bf_and_af = cap_factor_source[:,sample_idx_plus_bf_and_af]
-                    cap_factor_sample_plus_bf_and_af_notnan = ~np.isnan(cap_factor_sample_plus_bf_and_af)
-                    num_obs_in_this_idx = np.sum(cap_factor_sample_plus_bf_and_af_notnan)
-                    ctr = ctr + 1
-                if num_obs_in_this_idx >= num_source:
-                    cap_factors[select_source,y,i] = np.random.choice(cap_factor_sample_plus_bf_and_af[cap_factor_sample_plus_bf_and_af_notnan], size=num_source)
-                else:
-                    cap_factors[select_source,y,i] = np.nan # will get replaced later
-            
-        # Production costs
-        if np.isin(source, gv.intermittent):
-            # Intermittent sources have cost of zero
-            production_costs[select_source,y,:] = 0.0
-            
-        else:
-            # Use heat rates and gas/coal prices to create base price
-            production_costs[select_source,y,:] = heat_rates[select_source,np.newaxis] * (np.isin(source, np.array([gv.coal])) * coal_prices[np.newaxis,sample_indices] + np.isin(source, gv.natural_gas) * gas_prices[np.newaxis,sample_indices])
-            
-            # Add on the cost shock from estimated distribution
-            if np.isin(source, production_cost_est_sources):
-                production_costs[select_source,y,:] = production_costs[select_source,y,:] + production_cost_shocks[select_source,:]
-            
-# Fill in the year-sources that didn't have any observations
-for s, source in enumerate(np.unique(energy_sources)):
-    select_source = energy_sources == source
-    nan_yr = np.any(np.isnan(cap_factors[select_source,:,:]), axis=(0,2))
-    if np.any(nan_yr): # if there is some year where they are all NaN
-        for y, year in enumerate(years_unique):
-            if nan_yr[y]:
-                non_nan_yr_idx = np.arange(years_unique.shape[0])[~nan_yr]
-                closest_non_nan_yr = non_nan_yr_idx[np.argmin(np.abs(non_nan_yr_idx - y))]
-                print(f"{source} in year {year} has NaNs, replacing with {years_unique[closest_non_nan_yr]}.", flush=True)
-                cap_factors[select_source,y,:] = np.copy(cap_factors[select_source,closest_non_nan_yr,:]) # just use the sample from the closest non-NaN year
-
-# Create available capacities array
-available_capacities = cap_factors * capacities[:,np.newaxis,np.newaxis] / 2.0 # / 2.0 to put in half-hour intervals
+# %%
+# Draw from normal based on estimates of distribution
+production_cost_shocks = np.tile(mu_gens[:,np.newaxis,np.newaxis], (1, sample_length, num_draws))
 
 # %%
 # Determine the demand shocks based on demand realizations and prices
-
-# Determine the average price in each year
-avg_wholesale_price = np.ones(num_years) * np.nan
-xis = np.ones(demand_realizations.shape) * np.nan
+xis = np.ones(total_load_all.shape) * np.nan
 for y, year in enumerate(years_unique):
     select_yr = years == year
-    avg_wholesale_price[y] = np.average(prices[select_yr], weights=total_load_all[select_yr]) # use the load that includes even the dropped generators
-    xis[y,:] = demand.q_demanded_inv(tariffs_sample[y,:], demand_elasticity, demand_realizations[y,:])
+    xis[select_yr] = demand.q_demanded_inv(tariffs[select_yr], demand_elasticity, total_load_all[select_yr])
 print(f"Backed out demand shocks from demand realizations.", flush=True)
+
+# %%
+# Fill in observations that don't have capacity factor observations with same day in another year
+
+# Create list of intervals if all years had same number
+max_intervals_in_year = np.max(years_unique_counts)
+interval_date_strings = np.array([f"{years[i]}-{months[i]}-{days[i]}" for i in range(years.shape[0])])
+interval_date_strings_full = np.array([f"{years_unique[i]}-{months[j]}-{days[j]}" for i in range(years_unique.shape[0]) for j in np.arange(years.shape[0])[years == years_unique[np.argmax(years_unique_counts)]]]) # as if every year had leap year
+interval_exists = np.isin(interval_date_strings_full, interval_date_strings)
+
+# Go through each source and take from different year if missing source in that interval
+cap_factors_fill = {}
+for s, source in enumerate(np.unique(energy_sources)):
+    # Construct array of capacity factors for the source with year as an index
+    cap_factor_source = np.ones((cap_factor[source].shape[0], interval_date_strings_full.shape[0]))
+    cap_factor_source[:,interval_exists] = cap_factor[source]
+    cap_factor_source = np.reshape(cap_factor_source, (cap_factor_source.shape[0], years_unique.shape[0], max_intervals_in_year)) # separate by years
+
+    # If there is no observation in an interval, use values from closest year without missing index
+    cap_factor_source_full = np.copy(cap_factor_source)
+    cap_factor_source_nan = np.isnan(cap_factor_source)
+    missing_idx = np.all(cap_factor_source_nan, axis=0)
+
+    # Loop over each year and interval to replace missing values
+    for j in range(cap_factor_source.shape[2]): # loop over intervals
+        for i in range(cap_factor_source.shape[1]): # loop over years
+            if missing_idx[i,j]:
+                # Find the closest valid year (i_replace) for the same interval
+                i_replace = None
+                for k in range(1, cap_factor_source.shape[1]):
+                    # Check previous years
+                    if i - k >= 0 and not missing_idx[i - k,j]:
+                        i_replace = i - k
+                        break
+                    # Check next years
+                    if i + k < cap_factor_source.shape[1] and not missing_idx[i + k,j]:
+                        i_replace = i + k
+                        break
+                if i_replace is not None:
+                    cap_factor_source_full[:,i,j] = cap_factor_source[:,i_replace,j]
+                else:
+                    print(f"Unable to find a replacement for source {source} in year {i} and interval {j}")
+
+    print(f"{source} needing replacing: {np.sum(missing_idx)}")
+
+    # Remove "extra" leap days
+    cap_factor_source = np.reshape(cap_factor_source_full, (cap_factor_source.shape[0], cap_factor_source.shape[1] * cap_factor_source.shape[2]))
+    cap_factors_fill[source] = cap_factor_source[:,interval_exists]
+
+# %%
+# Construct capacity factors that fill all generators
+min_year_idx_years_list = year_specification * num_years_in_year_grouping
+max_year_idx_years_list = (year_specification + 1) * num_years_in_year_grouping if year_specification + 1 < num_year_groupings else np.minimum((year_specification + 2) * num_years_in_year_grouping - 1, years_list.shape[0])
+select_year = np.isin(years, years_list[min_year_idx_years_list:max_year_idx_years_list])
+num_intervals_year = np.sum(select_year)
+cap_factors = np.ones((capacities.shape[0], num_intervals_year)) * np.nan
+np.random.seed(1234567)
+for s, source in enumerate(np.unique(energy_sources)):
+    print(f"Computing {source}...", flush=True)
+    select_source = energy_sources == source
+    num_source = np.sum(select_source)
+    cap_factor_source = cap_factors_fill[source][:,select_year] # select the interval 
+    for i in range(num_intervals_year): # sample capacity factors from each date
+        cap_factor_sample = cap_factor_source[:,i]
+        cap_factor_sample_notnan = ~np.isnan(cap_factor_sample)
+        num_obs_in_this_idx = np.sum(cap_factor_sample_notnan)
+        if num_obs_in_this_idx > 0:
+            cap_factors[select_source,i] = np.random.choice(cap_factor_sample[cap_factor_sample_notnan], size=num_source)
+        else: # shouldn't happen b/c we filled in previously
+            print(f"Problem with source {source} in year {years_list[year_specification]}", flush=True)
+            cap_factors[select_source,i] = np.nan # will get replaced later
+
+# %%
+# Construct draws
+
+# Standardize each variable group separately
+scaler_xis = StandardScaler()
+scaler_max_prices = StandardScaler()
+scaler_dsp_quantities = StandardScaler()
+scaler_dsp_prices = StandardScaler()
+scaler_carbon_taxes = StandardScaler()
+scaler_cap_factors = StandardScaler()
+scaler_coal_prices = StandardScaler()
+scaler_gas_prices = StandardScaler()
+standardized_xis = np.reshape(scaler_xis.fit_transform(xis[select_year][:,np.newaxis]), (1, -1))
+standardized_max_prices = np.reshape(scaler_max_prices.fit_transform(max_prices[select_year][:,np.newaxis]), (1, -1))
+standardized_dsp_quantities = np.reshape(scaler_dsp_quantities.fit_transform(dsp_quantities[select_year][:,np.newaxis]), (1, -1))
+standardized_carbon_taxes = np.reshape(scaler_carbon_taxes.fit_transform(carbon_taxes[select_year][:,np.newaxis]), (1, -1))
+standardized_cap_factors = np.reshape(scaler_cap_factors.fit_transform(np.reshape(cap_factors, (-1, 1))), cap_factors.shape)
+standardized_coal_prices = np.reshape(scaler_coal_prices.fit_transform(coal_prices[select_year][:,np.newaxis]), (1, -1))
+standardized_gas_prices = np.reshape(scaler_gas_prices.fit_transform(gas_prices[select_year][:,np.newaxis]), (1, -1))
+
+# Create sample with all standardized variables
+samples = np.concatenate((standardized_xis, standardized_max_prices, standardized_dsp_quantities, standardized_carbon_taxes, standardized_cap_factors, standardized_coal_prices, standardized_gas_prices), axis=0)
+samples = np.reshape(samples[:,:int(np.floor(samples.shape[1] // sample_length) * sample_length)], (samples.shape[0], -1, sample_length)) # drop the last observations that wouldn't fit due to need draws to be of length sample_length
+samples = np.moveaxis(samples, 2, 1)
+samples = np.reshape(samples, (samples.shape[0] * samples.shape[1], samples.shape[2])) # now everything within the sample_length-long interval is a different variable of the same draw
+samples = samples.T # so now num_draws x (num_variables * sample_length)
+
+# Select initial cluster, going to be the one with the largest xi
+dimensions_of_interest = np.arange(sample_length) # these are the ones that capture the xis
+max_idx = np.argmax(np.max(samples[:,dimensions_of_interest], axis=1)) # index with the largest xi
+first_centroid = samples[max_idx,:].reshape(1, -1)
+
+# Determine the other centroids using k-means++
+random_state = check_random_state(12345)
+distances = np.sum((samples - first_centroid)**2.0, axis=1)
+remaining_centroids = []
+for _ in range(num_draws - 1):
+    # Select the next centroid with a probability proportional to the distance squared
+    probs = distances / np.sum(distances)
+    cumulative_probs = np.cumsum(probs)
+    r = random_state.rand()
+    next_centroid = samples[np.searchsorted(cumulative_probs, r)]
+    remaining_centroids.append(next_centroid)
+    
+    # Update the distances with the new centroid
+    distances = np.minimum(distances, np.sum((samples - next_centroid)**2.0, axis=1))
+clusters = np.vstack([first_centroid] + remaining_centroids) # add the centroids together
+
+# Assign observations to clusters
+distances = cdist(samples, clusters, "euclidean")
+labels = np.argmin(distances, axis=1)
+
+# Rescale centroids back to original scale for each variable
+clusters_xis = np.reshape(scaler_xis.inverse_transform(np.reshape(clusters[:,:sample_length], (num_draws * sample_length, 1))), (num_draws, sample_length))
+clusters_max_prices = np.reshape(scaler_max_prices.inverse_transform(np.reshape(clusters[:,sample_length:2*sample_length], (num_draws * sample_length, 1))), (num_draws, sample_length))
+clusters_dsp_quantities = np.reshape(scaler_dsp_quantities.inverse_transform(np.reshape(clusters[:,2*sample_length:3*sample_length], (num_draws * sample_length, 1))), (num_draws, sample_length))
+clusters_carbon_taxes = np.reshape(scaler_carbon_taxes.inverse_transform(np.reshape(clusters[:,3*sample_length:4*sample_length], (num_draws * sample_length, 1))), (num_draws, sample_length))
+clusters_cap_factors = np.reshape(scaler_cap_factors.inverse_transform(np.reshape(clusters[:,4*sample_length:4*sample_length+cap_factors.shape[0]*sample_length], (num_draws * sample_length * cap_factors.shape[0], 1))), (num_draws, cap_factors.shape[0] * sample_length))
+clusters_coal_prices = np.reshape(scaler_coal_prices.inverse_transform(np.reshape(clusters[:,4*sample_length+cap_factors.shape[0]*sample_length:5*sample_length+cap_factors.shape[0]*sample_length], (num_draws * sample_length, 1))), (num_draws, sample_length))
+clusters_gas_prices = np.reshape(scaler_gas_prices.inverse_transform(np.reshape(clusters[:,5*sample_length+cap_factors.shape[0]*sample_length:], (num_draws * sample_length, 1))), (num_draws, sample_length))
+clusters = np.concatenate((clusters_xis, clusters_max_prices, clusters_dsp_quantities, clusters_carbon_taxes, clusters_cap_factors, clusters_coal_prices, clusters_gas_prices), axis=1)
+
+# Compute cluster sizes and probabilities
+cluster_sizes = np.bincount(labels)
+cluster_probabilities = cluster_sizes / samples.shape[0]
+
+# %%
+# Construct variables for computing equilibrium
+
+dsp_quantities_sample = clusters_dsp_quantities.T
+available_capacities_sample = np.reshape(clusters_cap_factors, (clusters_cap_factors.shape[0], cap_factors.shape[0], sample_length)) * capacities[np.newaxis,:,np.newaxis] / 2.0 # / 2.0 to put in half-hour intervals
+available_capacities_sample = np.moveaxis(np.moveaxis(available_capacities_sample, 1, 0), 2, 1)
+production_costs_sample = np.nan_to_num(heat_rates)[np.newaxis,:,np.newaxis] * ((energy_sources == gv.coal)[np.newaxis,:,np.newaxis] * clusters_coal_prices[:,np.newaxis,:] + np.isin(energy_sources, gv.natural_gas)[np.newaxis,:,np.newaxis] * clusters_gas_prices[:,np.newaxis,:]) + np.moveaxis(production_cost_shocks, 2, 0)
+production_costs_sample = np.moveaxis(np.moveaxis(production_costs_sample, 1, 0), 2, 1)
+production_costs_w_carbon_tax_sample = production_costs_sample + co2_rates[:,np.newaxis,np.newaxis] * clusters_carbon_taxes.T[np.newaxis,:,:]
+xis_sample = clusters_xis.T
+max_prices_sample = clusters_max_prices.T
 
 # %%
 # Reshape array, we will shape it back later
@@ -672,36 +802,6 @@ data_state_idx_choice_strategic = np.ravel_multi_index(data_state_idx_choice_str
 state_shape_arr = np.array(state_shape_list)
 state_shape_arr_gr1 = state_shape_arr[state_shape_arr > 1] # the dimensions that can actually change
 indices_unraveled = np.array(list(np.unravel_index(np.arange(np.prod(state_shape_list)), state_shape_arr_gr1)))
-
-# # Determine what the indices are of adjustment with one-step choices for competitive firms
-# state_shape_arr_competitive = state_shape_arr[competitive_dims]
-# state_shape_arr_competitive = state_shape_arr_competitive[state_shape_arr_competitive > 1]
-# num_dims_changes_competitive = state_shape_arr_competitive.shape[0]
-# num_options = 3**num_dims_changes_competitive # number of possible combinations of changes in one period
-# add_vals = np.zeros((indices_unraveled.shape[0], num_options), dtype=int) # initialize array of what options are in each period
-# add_vals_competitive = np.array(list(np.unravel_index(np.arange(num_options), tuple([3 for i in range(num_dims_changes_competitive)])))) - 1 # flattened version of all the possible ways in which can make a one-step adjustment in that direction, -1 gives us -1, 0 and 1 (instead of 0,1,2)
-# add_vals[competitive_dims[state_shape_arr > 1],:] = add_vals_competitive
-# unraveled_indices_addon = indices_unraveled[:,:,np.newaxis] + add_vals[:,np.newaxis,:]
-# adjusted_indices_competitive = np.ravel_multi_index(unraveled_indices_addon, state_shape_arr_gr1, mode="wrap")
-# adjusted_indices_competitive[np.any(unraveled_indices_addon >= state_shape_arr_gr1[:,np.newaxis,np.newaxis], axis=0) | np.any(unraveled_indices_addon < 0, axis=0)] = 99999999999 # large number so doesn't correspond to any index
-# relevant_adjusted_indices_competitive = np.take_along_axis(adjusted_indices_competitive, data_state_idx_start_competitive[:,np.newaxis], axis=0)
-# compare_indices_competitive = relevant_adjusted_indices_competitive == data_state_idx_choice_competitive[:,np.newaxis]
-# indices_adjustment_competitive = np.where(compare_indices_competitive)[1]
-
-# # Determine what the indices are of adjustment with one-step choices for strategic firms
-# state_shape_arr_strategic = state_shape_arr[strategic_dims]
-# state_shape_arr_strategic = state_shape_arr_strategic[state_shape_arr_strategic > 1]
-# num_dims_changes_strategic = state_shape_arr_strategic.shape[0]
-# num_options = 3**num_dims_changes_strategic # number of possible combinations of changes in one period
-# add_vals = np.zeros((indices_unraveled.shape[0], num_options), dtype=int) # initialize array of what options are in each period
-# add_vals_strategic = np.array(list(np.unravel_index(np.arange(num_options), tuple([3 for i in range(num_dims_changes_strategic)])))) - 1 # flattened version of all the possible ways in which can make a one-step adjustment in that direction, -1 gives us -1, 0 and 1 (instead of 0,1,2)
-# add_vals[strategic_dims[state_shape_arr > 1],:] = add_vals_strategic
-# unraveled_indices_addon = indices_unraveled[:,:,np.newaxis] + add_vals[:,np.newaxis,:]
-# adjusted_indices_strategic = np.ravel_multi_index(unraveled_indices_addon, state_shape_arr_gr1, mode="wrap")
-# adjusted_indices_strategic[np.any(unraveled_indices_addon >= state_shape_arr_gr1[:,np.newaxis,np.newaxis], axis=0) | np.any(unraveled_indices_addon < 0, axis=0)] = 99999999999 # large number so doesn't correspond to any index
-# relevant_adjusted_indices_strategic = np.take_along_axis(adjusted_indices_strategic, data_state_idx_start_strategic[:,np.newaxis], axis=0)
-# compare_indices_strategic = relevant_adjusted_indices_strategic == data_state_idx_choice_strategic[:,np.newaxis]
-# indices_adjustment_strategic = np.where(compare_indices_strategic)[1]
 
 # Determine the choice indices of each individual strategic firm
 indices_adjustment_strategic_by_firm = np.zeros((data_state_idx_choice_strategic.shape[0], list_firms_state.shape[0] - 1), dtype=int)
@@ -784,7 +884,7 @@ if np.all(np.sum(data_state_compare_start, axis=0) == 1) and np.all(np.sum(data_
     print(f"Yes", flush=True)
 else:
     print(f"No", flush=True)
-    
+
 # %%
 # Create table describing generators in market
 
@@ -793,8 +893,8 @@ info_sources = np.load(gv.info_sources, allow_pickle=True)
 # Begin table
 tex_table = ""
 tex_table += f"\\begin{{tabular}}{{ lllccccc }} \n"
-tex_table += f" & & & \multicolumn{{1}}{{c}}{{Capacity}} & \multicolumn{{1}}{{c}}{{Heat Rate}} & \multicolumn{{1}}{{c}}{{Emissions Rate}} & \multicolumn{{1}}{{c}}{{Entered}} & \multicolumn{{1}}{{c}}{{Exit}} \\\\ \n"
-tex_table += f"\multicolumn{{1}}{{c}}{{Generator}} & \multicolumn{{1}}{{c}}{{Firm}} & \multicolumn{{1}}{{c}}{{Technology}} & \multicolumn{{1}}{{c}}{{(MW)}} & \multicolumn{{1}}{{c}}{{(GJ/MWh)}} & \multicolumn{{1}}{{c}}{{(kg$\\text{{CO}}_{{2}}$-eq/MWh)}} & \multicolumn{{1}}{{c}}{{Year}} & \multicolumn{{1}}{{c}}{{Year}} \\\\ \n"
+tex_table += f" & & & \\multicolumn{{1}}{{c}}{{Capacity}} & \\multicolumn{{1}}{{c}}{{Heat Rate}} & \\multicolumn{{1}}{{c}}{{Emissions Rate}} & \\multicolumn{{1}}{{c}}{{Entered}} & \\multicolumn{{1}}{{c}}{{Exit}} \\\\ \n"
+tex_table += f"\\multicolumn{{1}}{{c}}{{Generator}} & \\multicolumn{{1}}{{c}}{{Firm}} & \\multicolumn{{1}}{{c}}{{Technology}} & \\multicolumn{{1}}{{c}}{{(MW)}} & \\multicolumn{{1}}{{c}}{{(GJ/MWh)}} & \\multicolumn{{1}}{{c}}{{(kg$\\text{{CO}}_{{2}}$-eq/MWh)}} & \\multicolumn{{1}}{{c}}{{Year}} & \\multicolumn{{1}}{{c}}{{Year}} \\\\ \n"
 tex_table += "\\hline \n"
 
 # Add data
@@ -814,7 +914,10 @@ for i in range(facilities.shape[0]):
     if ("KWINANA" in facilities[i]) and ("KWINANA_GT" not in facilities[i]) and ("CCG" not in facilities[i]):
         tex_table += f"${{}}^{{*}}$"
     tex_table += f" & "
-    tex_table += f"{capacities[i]:,.0f} & ".replace(",", "\\,")
+    tex_table += f"{capacities[i]:,.0f}".replace(",", "\\,")
+    if "KEMERTON" in facilities[i]:
+        tex_table += f"${{}}^{{\\P}}$"
+    tex_table += " & "
     tex_table += f"{heat_rates[i]:,.1f}" if not np.isnan(heat_rates[i]) else "--"
     if np.isin(info_sources[facilities_orig == facilities[i]], np.array(["skm_impute", "skm_confidential"])):
         tex_table += f"${{}}^{{\\dagger}}$"
@@ -839,7 +942,7 @@ tex_table += f"\\hline \n \\end{{tabular}} \n"
     
 print(tex_table, flush=True)
 
-if running_specification == 0:
+if slurm_array_num == 0:
     create_file(gv.tables_path + "generator_list.tex", tex_table)
 
 # %%
@@ -855,7 +958,7 @@ for i, source in enumerate(energy_sources_not_included_unique):
     max_capacity[i] = np.max(capacities_not_included[energy_sources_not_included == source])
 print(f"maximum capacity for not included solar/wind: {np.round(np.max(max_capacity[np.isin(energy_sources_not_included_unique, gv.intermittent)]), 1)}", flush=True)
 print(f"maximum capacity for not included gas/coal: {np.round(np.max(max_capacity[np.isin(energy_sources_not_included_unique, np.concatenate((gv.natural_gas, np.array([gv.coal]))))]), 1)}", flush=True)
-    
+
 # %%
 # Determine the equilibrium and relevant variables in each state
 if running_specification == 0:
@@ -865,53 +968,125 @@ start_task = time.time()
 # Rename facilities, participants, and energy sources to integers (will be quicker for comparisons than with strings)
 facilities_unique, facilities_int = np.unique(facilities, return_inverse=True)
 participants_unique, participants_int = np.unique(participants, return_inverse=True)
+participants_alt_unique, participants_alt_int = np.unique(participants_alt, return_inverse=True)
 energy_sources_unique, energy_sources_int = np.unique(energy_sources, return_inverse=True)
 facilities_int_unique = np.unique(facilities_int)
 participants_int_unique = np.unique(participants_int)
+participants_alt_int_unique = np.unique(participants_alt_int)
 energy_sources_int_unique = np.unique(energy_sources_int)
 
-# Initialize arrays
-profits = np.zeros((array_state_in.shape[1], num_years, participants_int_unique.shape[0]))
-emissions = np.zeros((array_state_in.shape[1], num_years))
-blackouts = np.zeros((array_state_in.shape[1], num_years))
-frac_by_source = np.zeros((array_state_in.shape[1], num_years, energy_sources_int_unique.shape[0]))
-quantity_weighted_avg_price = np.zeros((array_state_in.shape[1], num_years))
-total_produced = np.zeros((array_state_in.shape[1], num_years))
-misallocated_demand = np.zeros((array_state_in.shape[1], num_years))
-consumer_surplus = np.zeros((array_state_in.shape[1], num_years))
+# Create sources with limited starts
+limited_start_energy_sources = energy_sources_int_unique[np.isin(energy_sources_unique, np.array([gv.coal, gv.gas_ccgt]))]
 
-# Add on carbon taxes
-production_costs_w_carbon_tax = production_costs + (co2_rates[:,np.newaxis,np.newaxis] * carbon_taxes_rates[np.newaxis,:])
+# Create sources that are intermittent, 0 MC
+intermittent_0mc_sources = energy_sources_int_unique[np.isin(energy_sources_unique, gv.intermittent)]
+
+# Initialize arrays
+profits = np.zeros((array_state_in.shape[1], participants_int_unique.shape[0]))
+emissions = np.zeros((array_state_in.shape[1],))
+blackouts = np.zeros((array_state_in.shape[1],))
+frac_by_source = np.zeros((array_state_in.shape[1], energy_sources_int_unique.shape[0]))
+quantity_weighted_avg_price = np.zeros((array_state_in.shape[1],))
+total_produced = np.zeros((array_state_in.shape[1],))
+misallocated_demand = np.zeros((array_state_in.shape[1],))
+consumer_surplus = np.zeros((array_state_in.shape[1],))
+renewable_production = np.zeros((array_state_in.shape[1],))
+total_production_cost = np.zeros((array_state_in.shape[1],))
 
 # Determine number of half hours that are in a year
 num_half_hours = gv.num_intervals_in_day * 365.0
 
-def compute_eqm(indices):
-    i, y = indices[0], indices[1]
-    index_dimensions = (array_state_in.shape[1],years_unique.shape[0])
-    raveled_idx = np.ravel_multi_index(indices, index_dimensions)
-    if raveled_idx % 1000000 == 0:
-        print(f"\t{raveled_idx} / {np.prod(index_dimensions)}", flush=True)
-    select_gens = array_state_in[:,i]
-    return eqm.expected_profits(available_capacities[select_gens,y,:], production_costs_w_carbon_tax[select_gens,y,:], production_costs[select_gens,y,:], participants_int[select_gens], participants_int_unique, energy_sources_int[select_gens], energy_sources_int_unique, co2_rates[select_gens], price_cap[y,:], fixed_tariff_component, demand_elasticity, xis[y,:], avg_wholesale_price[y], num_half_hours)
-        
-# Initialize multiprocessing
-if running_specification == 0:
-    pool = Pool(num_cpus)
-    chunksize = 4
-    for ind, res in enumerate(pool.imap(compute_eqm, product(range(array_state_in.shape[1]), range(years_unique.shape[0]))), chunksize):
-        idx = ind - chunksize # index number accounting for chunksize
-        profits.flat[idx*participants_int_unique.shape[0]:(idx+1)*participants_int_unique.shape[0]] = res[0]
-        emissions.flat[idx] = res[1]
-        blackouts.flat[idx] = res[2]
-        frac_by_source.flat[idx*energy_sources_int_unique.shape[0]:(idx+1)*energy_sources_int_unique.shape[0]] = res[3]
-        quantity_weighted_avg_price.flat[idx] = res[4]
-        total_produced.flat[idx] = res[5]
-        misallocated_demand.flat[idx] = res[6]
-        consumer_surplus.flat[idx] = res[7]
-    pool.close()
+# Determine which intervals to use in constructing averages
+keep_t_sample = np.ones((sample_length,), dtype=bool)
+keep_t_sample[:drop_before] = False
+keep_t_sample[-drop_after:] = False
 
-    print(f"Completed solving for equilibrium in each year in {np.round(time.time() - start_task, 1)} seconds.", flush=True)
+# Create an initial candidate price
+candidate_avg_price = np.average(prices, weights=total_load_all)
+
+# Initialize ramping costs
+ramping_costs = ramping_costs_gens
+
+# Create arrays of "generators" with demand response
+blackout_generator_capacity = 9999.9 * np.ones((1, available_capacities_sample.shape[1], available_capacities_sample.shape[2])) # unlimited capacity blackout "generator"
+blackout_generator_price = max_prices_sample[np.newaxis,:,:]
+dsp_prices_sample = 0.99 * blackout_generator_price # use price cap, just slightly below so JuMP optimizer uses this price rather than blackout price, don't use 0.9999999 b/c JuMP is doing an approximation, and we'll get blackouts rather than DSP
+available_capacities_use = np.concatenate((available_capacities_sample, dsp_quantities_sample[np.newaxis,:,:], blackout_generator_capacity), axis=0)
+production_costs_use = np.concatenate((production_costs_w_carbon_tax_sample, dsp_prices_sample, blackout_generator_price), axis=0)
+production_costs_wo_tax_use = np.concatenate((production_costs_sample, np.zeros((2, dsp_quantities_sample.shape[0], dsp_quantities_sample.shape[1]))), axis=0)
+participants_use = np.concatenate((participants_int, np.array([-1, -2]))) # -1 = DSP, -2 = blackout
+participants_alt_use = np.concatenate((participants_alt_int, np.array([-1, -2]))) # -1 = DSP, -2 = blackout
+energy_sources_use = np.concatenate((energy_sources_int, np.array([-1, -2]))) # -1 = DSP, -2 = blackout
+co2_rates_use = np.concatenate((co2_rates, np.zeros((2,))))
+ramping_costs_use = np.concatenate((ramping_costs, np.zeros((2,))))
+initial_quantities_use = np.concatenate((np.zeros((available_capacities_sample.shape[0], available_capacities_sample.shape[2])), np.zeros((2, dsp_quantities_sample.shape[1]))), axis=0)
+generators_w_ramping_costs = ~np.isclose(ramping_costs_use, 0.0)
+
+# Create indices used in this SLURM job
+indices_array = np.arange(array_state_in.shape[1])
+num_indices_in_computation_grouping = int(np.floor(indices_array.shape[0] / num_computation_groups_per_specification))
+min_year_idx_indices_array = computation_group_specification * num_indices_in_computation_grouping
+max_year_idx_indices_array = (computation_group_specification + 1) * num_indices_in_computation_grouping if computation_group_specification + 1 < num_indices_in_computation_grouping else np.minimum((computation_group_specification + 2) * num_indices_in_computation_grouping - 1, indices_array.shape[0])
+indices_array = indices_array[min_year_idx_indices_array:max_year_idx_indices_array]
+
+# Initialize model
+start = time.time()
+model, demand_lb, quantity, quantity_diff, market_clearing, quantity_lessthan_capacity = eqm.initialize_model(production_costs_use, ramping_costs_use, initial_quantities_use, generators_w_ramping_costs, print_msg=False)
+print(f"\tmodel initialization in {np.round(time.time() - start, 1)} seconds", flush=True)
+
+def compute_eqm(i, model, demand_lb, quantity, market_clearing, index_in_loop_val=None):
+    if index_in_loop_val is not None:
+        if index_in_loop_val % 100 == 0:
+            print(f"Computing index {i} ({index_in_loop_val + 1} / {indices_array.shape[0]}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+
+    # Provide available capacities of generators in market
+    select_gens = np.concatenate((array_state_in[:,i], np.ones((2,), dtype=bool))) # select the ith component, then add on the DSPs and price cap
+    true_generators = np.concatenate((np.ones(np.sum(array_state_in[:,i]), dtype=bool), np.zeros((2,), dtype=bool))) # + 1 for blackout "generator"
+    model = eqm.update_available_capacities(model, quantity_lessthan_capacity, available_capacities_use, select_gens)
+    
+    return eqm.expected_profits(model, 
+                                demand_lb, 
+                                quantity, 
+                                market_clearing, 
+                                select_gens, 
+                                available_capacities_use[select_gens,:,:], 
+                                production_costs_use[select_gens,:,:], 
+                                production_costs_wo_tax_use[select_gens,:,:], 
+                                participants_use[select_gens], 
+                                participants_int_unique, 
+                                energy_sources_use[select_gens], 
+                                energy_sources_int_unique, 
+                                co2_rates_use[select_gens], 
+                                true_generators, 
+                                ramping_costs_use[select_gens], 
+                                initial_quantities_use[select_gens,:], 
+                                fixed_tariff_component, 
+                                demand_elasticity, 
+                                xis_sample, 
+                                candidate_avg_price, 
+                                num_half_hours, 
+                                sample_weights=cluster_probabilities, 
+                                systemic_blackout_threshold=0.1, 
+                                keep_t_sample=None, 
+                                threshold_eps=0.01, 
+                                max_iter=6, 
+                                intermittent_0mc_sources=intermittent_0mc_sources, 
+                                print_msg=False)
+
+# Solve for equilibria
+if running_specification == 0:
+    for index_in_loop_val, idx in enumerate(indices_array):
+        res = compute_eqm(idx, model, demand_lb, quantity, market_clearing, index_in_loop_val=index_in_loop_val)
+        profits[idx,:] = res[0]
+        emissions[idx] = res[1]
+        blackouts[idx] = res[2]
+        frac_by_source[idx,:] = res[3]
+        quantity_weighted_avg_price[idx] = res[4]
+        total_produced[idx] = res[5]
+        misallocated_demand[idx] = res[6]
+        consumer_surplus[idx] = res[7]
+
+    print(f"Completed solving for equilibria in {np.round(time.time() - start_task, 1)} seconds.", flush=True)
 
 # %%
 # Determine capacity payments
@@ -925,54 +1100,51 @@ bf_sample = cap_years < np.min(years_unique)
 cap_years = cap_years[~bf_sample]
 capacity_price = capacity_price[~bf_sample]
 
-# Make cap factors repeat for any years past last year of data
-cap_factors_extend = np.concatenate((cap_factors, np.tile(cap_factors[:,-1,:][:,np.newaxis,:], (1,np.max(cap_years) - np.max(years_unique),1))), axis=1)
-
 capacity_payments = np.zeros((array_state_in.shape[1], cap_years.shape[0], participants_int_unique.shape[0]))
 
 # Commitments of each generator
 expected_payments_permw_perdollar = 1.0 * ~np.isin(energy_sources_int, np.arange(energy_sources_unique.shape[0])[np.isin(energy_sources_unique, gv.intermittent)])[:,np.newaxis] # np.mean(cap_factors_extend, axis=2)
 
-def compute_payments(indices):
-    i = indices[0]
-    index_dimensions = (array_state_in.shape[1],)
-    raveled_idx = np.ravel_multi_index(indices, index_dimensions)
-    if raveled_idx % 1000000 == 0:
-        print(f"\t{raveled_idx} / {np.prod(index_dimensions)}", flush=True)
+def compute_payments(i, index_in_loop_val=None):
+    if index_in_loop_val is not None:
+        if index_in_loop_val % 100 == 0:
+            print(f"Computing index {i} ({index_in_loop_val + 1} / {indices_array.shape[0]}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     select_gens = array_state_in[:,i]
     return cc.expected_cap_payment(expected_payments_permw_perdollar[select_gens,:], capacities[select_gens], capacity_price, participants_int[select_gens], participants_int_unique)
         
-# Initialize multiprocessing
-if running_specification == 0:
-    pool = Pool(num_cpus)
-    chunksize = 4
-    for ind, res in enumerate(pool.imap(compute_payments, product(range(array_state_in.shape[1]))), chunksize):
-        idx = ind - chunksize # index number accounting for chunksize
-        capacity_payments.flat[idx*(cap_years.shape[0]*participants_int_unique.shape[0]):(idx+1)*(cap_years.shape[0]*participants_int_unique.shape[0])] = res[0]
-    pool.close()
+# Solve for capacity payments
+if (running_specification == 0) and (year_specification == 0): # year specification == 0 b/c done all at once
+    for index_in_loop_val, idx in enumerate(indices_array):
+        capacity_payments[idx,:,:] = compute_payments(idx, index_in_loop_val=index_in_loop_val)
 
     print(f"Completed solving for capacity payments in {np.round(time.time() - start_task, 1)} seconds.", flush=True)
 
 # %%
 # Save arrays
 if running_specification == 0:
-    np.savez_compressed(f"{gv.arrays_path}data_env.npz", 
-                        profits=profits, 
-                        emissions=emissions, 
-                        blackouts=blackouts, 
-                        frac_by_source=frac_by_source, 
-                        quantity_weighted_avg_price=quantity_weighted_avg_price, 
-                        total_produced=total_produced, 
-                        misallocated_demand=misallocated_demand, 
-                        consumer_surplus=consumer_surplus, 
-                        capacity_payments=capacity_payments)
+    np.savez_compressed(f"{gv.arrays_path}data_env_{year_specification}_{computation_group_specification}.npz", 
+                        profits=profits[indices_array,:], 
+                        emissions=emissions[indices_array], 
+                        blackouts=blackouts[indices_array], 
+                        frac_by_source=frac_by_source[indices_array,:], 
+                        quantity_weighted_avg_price=quantity_weighted_avg_price[indices_array], 
+                        total_produced=total_produced[indices_array], 
+                        misallocated_demand=misallocated_demand[indices_array], 
+                        consumer_surplus=consumer_surplus[indices_array])
+if (running_specification == 0) and (year_specification == 0):
+    np.savez_compressed(f"{gv.arrays_path}data_env_cap_payments_{computation_group_specification}.npz", 
+                        capacity_payments=capacity_payments[indices_array,:,:])
+if slurm_array_num == 0:
     np.savez_compressed(f"{gv.arrays_path}state_space.npz", 
                         facilities_unique=facilities_unique, 
                         facilities_int=facilities_int, 
                         facilities_int_unique=facilities_int_unique, 
                         participants_unique=participants_unique, 
+                        participants_alt_unique=participants_alt_unique, 
                         participants_int=participants_int, 
+                        participants_alt_int=participants_alt_int, 
                         participants_int_unique=participants_int_unique, 
+                        participants_alt_int_unique=participants_alt_int_unique, 
                         energy_sources_unique=energy_sources_unique, 
                         energy_sources_int=energy_sources_int, 
                         energy_sources_int_unique=energy_sources_int_unique, 
@@ -992,194 +1164,328 @@ if running_specification == 0:
 # Create price caps for counterfactuals
 low_price_cap_counterfactuals = 300.0
 high_price_cap_counterfactuals = 1000.0
-if running_specification == 0:
+if slurm_array_num == 0:
     create_file(gv.stats_path + "low_price_cap_counterfactuals.tex", f"{int(low_price_cap_counterfactuals):,}".replace(",", "\\,"))
-price_cap_counterfactuals = low_price_cap_counterfactuals * np.ones(price_cap.shape)
-if running_specification == 3:
-    price_cap_counterfactuals = high_price_cap_counterfactuals * np.ones(price_cap.shape)
     create_file(gv.stats_path + "high_price_cap_counterfactuals.tex", f"{int(high_price_cap_counterfactuals):,}".replace(",", "\\,"))
+production_costs_use = np.concatenate((production_costs_sample, dsp_prices_sample, blackout_generator_price), axis=0)
+production_costs_use[-1,:,:] = low_price_cap_counterfactuals
+if running_specification == 3:
+    production_costs_use[-1,:,:] = high_price_cap_counterfactuals
+production_costs_use[participants_use == -1,:,:] = 0.99 * production_costs_use[-1,:,:][np.newaxis,:,:] # use price cap, just slightly below so JuMP optimizer uses this price rather than blackout price, don't use 0.9999999 b/c JuMP is doing an approximation, and we'll get blackouts rather than DSP
 
 # %%
 # Carbon tax counterfactual
-if (running_specification == 1) or (running_specification == 3):
+if (running_specification == 1) or (running_specification == 3) or (running_specification == 4):
     print(f"Starting solving for carbon tax counterfactuals...", flush=True)
 start_task = time.time()
-carbon_taxes_linspace = np.linspace(0.0, 300.0, 7) # this is in AUD / ton CO2, need to put it in / kgCO2 later when use in equilibrium calculation
 
 # Initialize arrays
-profits = np.zeros((carbon_taxes_linspace.shape[0], array_state_in.shape[1], num_years, participants_int_unique.shape[0]))
-emissions = np.zeros((carbon_taxes_linspace.shape[0], array_state_in.shape[1], num_years))
-blackouts = np.zeros((carbon_taxes_linspace.shape[0], array_state_in.shape[1], num_years))
-frac_by_source = np.zeros((carbon_taxes_linspace.shape[0], array_state_in.shape[1], num_years, energy_sources_int_unique.shape[0]))
-quantity_weighted_avg_price = np.zeros((carbon_taxes_linspace.shape[0], array_state_in.shape[1], num_years))
-total_produced = np.zeros((carbon_taxes_linspace.shape[0], array_state_in.shape[1], num_years))
-misallocated_demand = np.zeros((carbon_taxes_linspace.shape[0], array_state_in.shape[1], num_years))
-consumer_surplus = np.zeros((carbon_taxes_linspace.shape[0], array_state_in.shape[1], num_years))
-total_production_cost = np.zeros((carbon_taxes_linspace.shape[0], array_state_in.shape[1], num_years))
+profits = np.zeros((array_state_in.shape[1], participants_int_unique.shape[0]))
+profits_alt = np.zeros((array_state_in.shape[1], participants_alt_int_unique.shape[0]))
+emissions = np.zeros((array_state_in.shape[1],))
+blackouts = np.zeros((array_state_in.shape[1],))
+frac_by_source = np.zeros((array_state_in.shape[1], energy_sources_int_unique.shape[0]))
+quantity_weighted_avg_price = np.zeros((array_state_in.shape[1],))
+total_produced = np.zeros((array_state_in.shape[1],))
+misallocated_demand = np.zeros((array_state_in.shape[1],))
+consumer_surplus = np.zeros((array_state_in.shape[1],))
+total_production_cost = np.zeros((array_state_in.shape[1],))
+dsp_profits = np.zeros((array_state_in.shape[1],))
+battery_profits = np.zeros((array_state_in.shape[1],))
+battery_discharge = np.zeros((array_state_in.shape[1],))
 
-def compute_eqm(indices):
-    c, i, y = indices[0], indices[1], indices[2]
-    index_dimensions = (carbon_taxes_linspace.shape[0],array_state_in.shape[1],years_unique.shape[0])
-    raveled_idx = np.ravel_multi_index(indices, index_dimensions)
-    if raveled_idx % 1000000 == 0:
-        print(f"\t{raveled_idx} / {np.prod(index_dimensions)}", flush=True)
-    production_costs_w_carbon_tax = production_costs + (co2_rates[:,np.newaxis,np.newaxis] * carbon_taxes_linspace[c] / 1000.0)
-    select_gens = array_state_in[:,i]
-    return eqm.expected_profits(available_capacities[select_gens,y,:], production_costs_w_carbon_tax[select_gens,y,:], production_costs[select_gens,y,:], participants_int[select_gens], participants_int_unique, energy_sources_int[select_gens], energy_sources_int_unique, co2_rates[select_gens], price_cap_counterfactuals[y,:], fixed_tariff_component, demand_elasticity, xis[y,:], avg_wholesale_price[y], num_half_hours)
-            
+# Determine whether need to sum profits in way in which all generators groupings are separate
+return_alternative_participant_specification = False
+if running_specification == 1: # just for specification == 1
+    return_alternative_participant_specification = True
 
-# Initialize multiprocessing
-if (running_specification == 1) or (running_specification == 3):
-    pool = Pool(num_cpus)
-    chunksize = 4
-    for ind, res in enumerate(pool.imap(compute_eqm, product(range(carbon_taxes_linspace.shape[0]), range(array_state_in.shape[1]), range(years_unique.shape[0]))), chunksize):
-        idx = ind - chunksize # index number accounting for chunksize
-        profits.flat[idx*participants_int_unique.shape[0]:(idx+1)*participants_int_unique.shape[0]] = res[0]
-        emissions.flat[idx] = res[1]
-        blackouts.flat[idx] = res[2]
-        frac_by_source.flat[idx*energy_sources_int_unique.shape[0]:(idx+1)*energy_sources_int_unique.shape[0]] = res[3]
-        quantity_weighted_avg_price.flat[idx] = res[4]
-        total_produced.flat[idx] = res[5]
-        misallocated_demand.flat[idx] = res[6]
-        consumer_surplus.flat[idx] = res[7]
-        total_production_cost.flat[idx] = res[9]
-    pool.close()
+# Determine production costs including carbon tax
+if (running_specification == 1) or (running_specification == 3) or (running_specification == 4):
+    production_costs_w_carbon_tax = production_costs_use + (co2_rates_use[:,np.newaxis,np.newaxis] * carbon_taxes_linspace[policy_specification] / 1000.0)
+    start = time.time()
+    if running_specification == 4:
+        battery_dict = {
+            'flow': battery_flow, 
+            'capacity': battery_capacity, 
+            'delta': battery_delta, 
+            'initial_stock': np.ones(num_draws) * 0.5 * battery_capacity
+        }
+        model, demand_lb, quantity, quantity_diff, quantity_charge, quantity_discharge, market_clearing, quantity_lessthan_capacity, battery_constraints = eqm.initialize_model(production_costs_w_carbon_tax, ramping_costs_use, initial_quantities_use, generators_w_ramping_costs, battery_dict=battery_dict, print_msg=False)
+        battery_dict['quantity_charge'] = quantity_charge
+        battery_dict['quantity_discharge'] = quantity_discharge
+    else:
+        battery_dict = None
+        model, demand_lb, quantity, quantity_diff, market_clearing, quantity_lessthan_capacity = eqm.initialize_model(production_costs_w_carbon_tax, ramping_costs_use, initial_quantities_use, generators_w_ramping_costs, print_msg=False)
+    print(f"\tmodel initialization in {np.round(time.time() - start, 1)} seconds", flush=True)
+
+def compute_eqm(i, model, demand_lb, quantity, market_clearing, battery_dict, index_in_loop_val=None):
+    if index_in_loop_val is not None:
+        if index_in_loop_val % 100 == 0:
+            print(f"Computing index {i} ({index_in_loop_val + 1} / {indices_array.shape[0]}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+
+    # Provide available capacities of generators in market
+    select_gens = np.concatenate((array_state_in[:,i], np.ones((2,), dtype=bool))) # select the ith component, then add on the DSPs and price cap
+    true_generators = np.concatenate((np.ones(np.sum(array_state_in[:,i]), dtype=bool), np.zeros((2,), dtype=bool))) # + 1 for blackout "generator"
+    start = time.time()
+    model = eqm.update_available_capacities(model, quantity_lessthan_capacity, available_capacities_use, select_gens)
+    
+    return eqm.expected_profits(model, 
+                                demand_lb, 
+                                quantity, 
+                                market_clearing, 
+                                select_gens, 
+                                available_capacities_use[select_gens,:,:], 
+                                production_costs_w_carbon_tax[select_gens,:,:], 
+                                production_costs_wo_tax_use[select_gens,:,:], 
+                                participants_use[select_gens], 
+                                participants_int_unique, 
+                                energy_sources_use[select_gens], 
+                                energy_sources_int_unique, 
+                                co2_rates_use[select_gens], 
+                                true_generators, 
+                                ramping_costs_use[select_gens], 
+                                initial_quantities_use[select_gens,:], 
+                                fixed_tariff_component, 
+                                demand_elasticity, 
+                                xis_sample, 
+                                candidate_avg_price, 
+                                num_half_hours, 
+                                battery_dict=battery_dict, 
+                                alternative_participants_dict={'participants_unique': participants_alt_int_unique, 'participants': participants_alt_use[select_gens]} if return_alternative_participant_specification else None, 
+                                sample_weights=cluster_probabilities, 
+                                systemic_blackout_threshold=0.1, 
+                                keep_t_sample=None, 
+                                threshold_eps=0.01, 
+                                max_iter=6, 
+                                intermittent_0mc_sources=intermittent_0mc_sources, 
+                                print_msg=False)
+
+# Run carbon tax counterfactuals
+if (running_specification == 1) or (running_specification == 3) or (running_specification == 4):
+    for index_in_loop_val, idx in enumerate(indices_array):
+        res = compute_eqm(idx, model, demand_lb, quantity, market_clearing, battery_dict=battery_dict, index_in_loop_val=index_in_loop_val)
+        if return_alternative_participant_specification:
+            profits[idx,:] = res[0][0]
+            profits_alt[idx,:] = res[0][1]
+        else:
+            profits[idx,:] = res[0]
+        emissions[idx] = res[1]
+        blackouts[idx] = res[2]
+        frac_by_source[idx,:] = res[3]
+        quantity_weighted_avg_price[idx] = res[4]
+        total_produced[idx] = res[5]
+        misallocated_demand[idx] = res[6]
+        consumer_surplus[idx] = res[7]
+        total_production_cost[idx] = res[9]
+        dsp_profits[idx] = res[10]
+        if running_specification == 4:
+            battery_profits[idx] = res[11]
+            battery_discharge[idx] = res[12]
 
     print(f"Completed the carbon tax counterfactual profits in {np.round(time.time() - start_task, 1)} seconds.", flush=True)
 
 # %%
 # Save arrays
+save_args = {
+    'profits': profits[indices_array,:],
+    'emissions': emissions[indices_array],
+    'blackouts': blackouts[indices_array],
+    'frac_by_source': frac_by_source[indices_array,:],
+    'quantity_weighted_avg_price': quantity_weighted_avg_price[indices_array],
+    'total_produced': total_produced[indices_array],
+    'misallocated_demand': misallocated_demand[indices_array],
+    'consumer_surplus': consumer_surplus[indices_array],
+    'total_production_cost': total_production_cost[indices_array], 
+    'dsp_profits': dsp_profits[indices_array]
+}
+if return_alternative_participant_specification:
+    save_args['profits_alt'] = profits_alt[indices_array,:]
 if running_specification == 1:
-    np.savez_compressed(f"{gv.arrays_path}counterfactual_env_co2tax.npz", 
-                        carbon_taxes_linspace=carbon_taxes_linspace, 
-                        profits=profits, 
-                        emissions=emissions, 
-                        blackouts=blackouts, 
-                        frac_by_source=frac_by_source, 
-                        quantity_weighted_avg_price=quantity_weighted_avg_price, 
-                        total_produced=total_produced, 
-                        misallocated_demand=misallocated_demand, 
-                        consumer_surplus=consumer_surplus, 
-                        total_production_cost=total_production_cost)
+    np.savez_compressed(f"{gv.arrays_path}counterfactual_env_co2tax_{policy_specification}_{year_specification}_{computation_group_specification}.npz", **save_args)
 if running_specification == 3:
-    np.savez_compressed(f"{gv.arrays_path}counterfactual_env_co2tax_highpricecap.npz", 
-                        carbon_taxes_linspace=carbon_taxes_linspace, 
-                        profits=profits, 
-                        emissions=emissions, 
-                        blackouts=blackouts, 
-                        frac_by_source=frac_by_source, 
-                        quantity_weighted_avg_price=quantity_weighted_avg_price, 
-                        total_produced=total_produced, 
-                        misallocated_demand=misallocated_demand, 
-                        consumer_surplus=consumer_surplus, 
-                        total_production_cost=total_production_cost)
+    np.savez_compressed(f"{gv.arrays_path}counterfactual_env_co2tax_highpricecap_{policy_specification}_{year_specification}_{computation_group_specification}.npz", **save_args)
+if running_specification == 4:
+    save_args['battery_profits'] = battery_profits[indices_array]
+    save_args['battery_discharge'] = battery_discharge[indices_array]
+    np.savez_compressed(f"{gv.arrays_path}counterfactual_battery_{policy_specification}_{year_specification}_{computation_group_specification}.npz", **save_args)
 
 # %%
 # Capacity payment counterfactual
 if running_specification == 1:
     print(f"Starting solving for capacity payment counterfactuals...", flush=True)
 start_task = time.time()
-capacity_payments_linspace = np.linspace(0.0, 200000.0, 5)
-
-# Process capacity payment program parameters
-# refund_multipliers = np.ones((facilities.shape[0], years_unique.shape[0])) * (gv.refund_multiplier_intermittent * np.isin(energy_sources, gv.intermittent) + gv.refund_multiplier_scheduled * ~np.isin(energy_sources, gv.intermittent))[:,np.newaxis] # don't need to extension past last year in data b/c the capacity price isn't changing
 
 capacity_payments = np.zeros((capacity_payments_linspace.shape[0],  array_state_in.shape[1], years_unique.shape[0], participants_int_unique.shape[0]))
+capacity_payments_alt = np.zeros((capacity_payments_linspace.shape[0],  array_state_in.shape[1], years_unique.shape[0], participants_alt_int_unique.shape[0]))
 
-# Solve for optimal commitments of each generator
-expected_payments_permw_perdollar = 1.0 * ~np.isin(energy_sources_int, np.arange(energy_sources_unique.shape[0])[np.isin(energy_sources_unique, gv.intermittent)])[:,np.newaxis] # np.mean(cap_factors_extend, axis=2)
+# Commitments of each generator
+expected_payments_permw_perdollar = 1.0 * ~np.isin(energy_sources_int, np.arange(energy_sources_unique.shape[0])[np.isin(energy_sources_unique, gv.intermittent)])[:,np.newaxis]
 
-def compute_payments(indices):
-    c, i = indices[0], indices[1]
-    index_dimensions = (capacity_payments_linspace.shape[0],array_state_in.shape[1])
-    raveled_idx = np.ravel_multi_index(indices, index_dimensions)
-    if raveled_idx % 1000000 == 0:
-        print(f"\t{raveled_idx} / {np.prod(index_dimensions)}", flush=True)
+def compute_payments(c, i, participants_int_unique_use, index_in_loop_val=None):
+    if index_in_loop_val is not None:
+        if index_in_loop_val % 100 == 0:
+            print(f"Computing index ({c}, {i}) ({index_in_loop_val + 1} / {capacity_payments_linspace.shape[0] * array_state_in.shape[1]}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     select_gens = array_state_in[:,i]
     capacity_price_years = np.ones(years_unique.shape[0]) * capacity_payments_linspace[c]
-    return cc.expected_cap_payment(expected_payments_permw_perdollar[select_gens,:], capacities[select_gens], capacity_price_years, participants_int[select_gens], participants_int_unique)
+    return cc.expected_cap_payment(expected_payments_permw_perdollar[select_gens,:], capacities[select_gens], capacity_price_years, participants_int[select_gens], participants_int_unique_use)
         
 # Initialize multiprocessing
-if running_specification == 1:
-    pool = Pool(num_cpus)
-    chunksize = 4
-    for ind, res in enumerate(pool.imap(compute_payments, product(range(capacity_payments_linspace.shape[0]), range(array_state_in.shape[1]))), chunksize):
-        idx = ind - chunksize # index number accounting for chunksize
-        capacity_payments.flat[idx*(years_unique.shape[0]*participants_int_unique.shape[0]):(idx+1)*(years_unique.shape[0]*participants_int_unique.shape[0])] = res[0]
-    pool.close()
+if (running_specification == 1) and (policy_specification == 0) and (year_specification == 0):
+    for index_in_loop_val, indices in enumerate(product(range(capacity_payments_linspace.shape[0]), indices_array)):
+        c, i = indices[0], indices[1]
+        capacity_payments[c,i,:,:] = compute_payments(c, i, participants_int_unique, index_in_loop_val=index_in_loop_val)
+        if return_alternative_participant_specification:
+            capacity_payments_alt[c,i,:,:] = compute_payments(c, i, participants_alt_int_unique, index_in_loop_val=index_in_loop_val)
 
     print(f"Completed the capacity payment counterfactual payments in {np.round(time.time() - start_task, 1)} seconds.", flush=True)
 
 # %%
 # Save arrays
-if running_specification == 1:
-    np.savez_compressed(f"{gv.arrays_path}counterfactual_env_capacitypayment.npz", 
-                        capacity_payments_linspace=capacity_payments_linspace, 
-                        capacity_payments=capacity_payments)
+save_args = {
+    'capacity_payments': capacity_payments[:,indices_array,:,:]
+}
+if return_alternative_participant_specification:
+    save_args['capacity_payments_alt'] = capacity_payments_alt[:,indices_array,:,:]
+if (running_specification == 1) and (policy_specification == 0) and (year_specification == 0):
+    np.savez_compressed(f"{gv.arrays_path}counterfactual_env_capacitypayment_{computation_group_specification}.npz", **save_args)
+
+# %%
+# Expanded capacity payment counterfactual
+if running_specification == 5:
+    print(f"Starting solving for expanded capacity payment counterfactuals...", flush=True)
+    start_task = time.time()
     
+    capacity_payments = np.zeros((capacity_payments_linspace.shape[0], capacity_payments_linspace_extended.shape[0], array_state_in.shape[1], years_unique.shape[0], participants_int_unique.shape[0]))
+    
+    # Commitments of each generator
+    expected_payments_permw_perdollar_coal = 1.0 * np.isin(energy_sources_int, np.arange(energy_sources_unique.shape[0])[np.isin(energy_sources_unique, gv.coal)])
+    expected_payments_permw_perdollar_gas = 1.0 * np.isin(energy_sources_int, np.arange(energy_sources_unique.shape[0])[np.isin(energy_sources_unique, np.array([gv.gas_ocgt, gv.gas_ccgt, gv.gas_cogen]))])
+    
+    def compute_payments(c, c_prime, i, participants_int_unique_use, index_in_loop_val=None):
+        if index_in_loop_val is not None:
+            if index_in_loop_val % 1000 == 0:
+                print(f"Computing index ({c}, {c_prime}, {i}) ({index_in_loop_val + 1} / {capacity_payments_linspace.shape[0] * capacity_payments_linspace_extended.shape[0] * array_state_in.shape[1]}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+        select_gens = array_state_in[:,i]
+        capacity_price_years_coal = np.ones(years_unique.shape[0]) * capacity_payments_linspace[c]
+        capacity_price_years_gas = np.ones(years_unique.shape[0]) * capacity_payments_linspace_extended[c_prime]
+        capacity_price_years = expected_payments_permw_perdollar_coal[:,np.newaxis] * capacity_price_years_coal[np.newaxis,:] + expected_payments_permw_perdollar_gas[:,np.newaxis] * capacity_price_years_gas[np.newaxis,:]
+        expected_payments_permw_perdollar = expected_payments_permw_perdollar_coal + expected_payments_permw_perdollar_gas
+        return cc.expected_cap_payment(expected_payments_permw_perdollar[select_gens,np.newaxis], capacities[select_gens], capacity_price_years[select_gens,:], participants_int[select_gens], participants_int_unique_use)
+        
+    # Initialize multiprocessing
+    for index_in_loop_val, indices in enumerate(product(range(capacity_payments_linspace.shape[0]), range(capacity_payments_linspace_extended.shape[0]), indices_array)):
+        c, c_prime, i = indices[0], indices[1], indices[2]
+        capacity_payments[c,c_prime,i,:,:] = compute_payments(c, c_prime, i, participants_int_unique, index_in_loop_val=index_in_loop_val)
+
+    print(f"Completed the capacity payment counterfactual payments in {np.round(time.time() - start_task, 1)} seconds.", flush=True)
+
+    save_args = {
+        'capacity_payments': capacity_payments[:,:,indices_array,:,:]
+    }
+    np.savez_compressed(f"{gv.arrays_path}counterfactual_env_capacitypaymentexpanded_{computation_group_specification}.npz", **save_args)
+
 # %%
 # Renewable subsidy counterfactual
 
 if running_specification == 2:
     print(f"Starting solving for renewable subsidy counterfactuals...", flush=True)
 start_task = time.time()
-renewable_subsidies_linspace = np.linspace(0.0, 150.0, 7)
 
 # Initialize arrays
-profits = np.zeros((renewable_subsidies_linspace.shape[0], array_state_in.shape[1], num_years, participants_int_unique.shape[0]))
-emissions = np.zeros((renewable_subsidies_linspace.shape[0], array_state_in.shape[1], num_years))
-blackouts = np.zeros((renewable_subsidies_linspace.shape[0], array_state_in.shape[1], num_years))
-frac_by_source = np.zeros((renewable_subsidies_linspace.shape[0], array_state_in.shape[1], num_years, energy_sources_int_unique.shape[0]))
-quantity_weighted_avg_price = np.zeros((renewable_subsidies_linspace.shape[0], array_state_in.shape[1], num_years))
-total_produced = np.zeros((renewable_subsidies_linspace.shape[0], array_state_in.shape[1], num_years))
-misallocated_demand = np.zeros((renewable_subsidies_linspace.shape[0], array_state_in.shape[1], num_years))
-consumer_surplus = np.zeros((renewable_subsidies_linspace.shape[0], array_state_in.shape[1], num_years))
-renewable_production = np.zeros((renewable_subsidies_linspace.shape[0], array_state_in.shape[1], num_years))
-total_production_cost = np.zeros((renewable_subsidies_linspace.shape[0], array_state_in.shape[1], num_years))
+profits = np.zeros((array_state_in.shape[1], participants_int_unique.shape[0]))
+emissions = np.zeros((array_state_in.shape[1],))
+blackouts = np.zeros((array_state_in.shape[1],))
+frac_by_source = np.zeros((array_state_in.shape[1], energy_sources_int_unique.shape[0]))
+quantity_weighted_avg_price = np.zeros((array_state_in.shape[1],))
+total_produced = np.zeros((array_state_in.shape[1],))
+misallocated_demand = np.zeros((array_state_in.shape[1],))
+consumer_surplus = np.zeros((array_state_in.shape[1],))
+renewable_production = np.zeros((array_state_in.shape[1],))
+total_production_cost = np.zeros((array_state_in.shape[1],))
+dsp_profits = np.zeros((array_state_in.shape[1],))
 
-def compute_eqm(indices):
-    s, i, y = indices[0], indices[1], indices[2]
-    index_dimensions = (renewable_subsidies_linspace.shape[0],array_state_in.shape[1],years_unique.shape[0])
-    raveled_idx = np.ravel_multi_index(indices, index_dimensions)
-    if raveled_idx % 1000000 == 0:
-        print(f"\t{raveled_idx} / {np.prod(index_dimensions)}", flush=True)
-    production_costs_w_renewable_subsidies = production_costs - renewable_subsidies_linspace[s] * np.isclose(co2_rates, 0.0)[:,np.newaxis,np.newaxis]
-    select_gens = array_state_in[:,i]
-    return eqm.expected_profits(available_capacities[select_gens,y,:], production_costs_w_renewable_subsidies[select_gens,y,:], production_costs[select_gens,y,:], participants_int[select_gens], participants_int_unique, energy_sources_int[select_gens], energy_sources_int_unique, co2_rates[select_gens], price_cap_counterfactuals[y,:], fixed_tariff_component, demand_elasticity, xis[y,:], avg_wholesale_price[y], num_half_hours)
-            
-
-# Initialize multiprocessing
+# Determine production costs including carbon tax
 if running_specification == 2:
-    pool = Pool(num_cpus)
-    chunksize = 4
-    for ind, res in enumerate(pool.imap(compute_eqm, product(range(renewable_subsidies_linspace.shape[0]), range(array_state_in.shape[1]), range(years_unique.shape[0]))), chunksize):
-        idx = ind - chunksize # index number accounting for chunksize
-        profits.flat[idx*participants_int_unique.shape[0]:(idx+1)*participants_int_unique.shape[0]] = res[0]
-        emissions.flat[idx] = res[1]
-        blackouts.flat[idx] = res[2]
-        frac_by_source.flat[idx*energy_sources_int_unique.shape[0]:(idx+1)*energy_sources_int_unique.shape[0]] = res[3]
-        quantity_weighted_avg_price.flat[idx] = res[4]
-        total_produced.flat[idx] = res[5]
-        misallocated_demand.flat[idx] = res[6]
-        consumer_surplus.flat[idx] = res[7]
-        renewable_production.flat[idx] = res[8]
-        total_production_cost.flat[idx] = res[9]
-    pool.close()
+    renewable_gens = np.isin(energy_sources_use, np.arange(energy_sources_unique.shape[0])[np.isin(energy_sources_unique, gv.intermittent)])
+    production_costs_w_renewable_subsidies = production_costs_use - renewable_subsidies_linspace[policy_specification] * renewable_gens[:,np.newaxis,np.newaxis]
+    start = time.time()
+    model, demand_lb, quantity, quantity_diff, market_clearing, quantity_lessthan_capacity = eqm.initialize_model(production_costs_w_renewable_subsidies, ramping_costs_use, initial_quantities_use, generators_w_ramping_costs, print_msg=False)
+    print(f"\tmodel initialization in {np.round(time.time() - start, 1)} seconds", flush=True)
+
+def compute_eqm(i, model, demand_lb, quantity, market_clearing, index_in_loop_val=None):
+    if index_in_loop_val is not None:
+        if index_in_loop_val % 100 == 0:
+            print(f"Computing index {i} ({index_in_loop_val + 1} / {indices_array.shape[0]}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+
+    # Provide available capacities of generators in market
+    select_gens = np.concatenate((array_state_in[:,i], np.ones((2,), dtype=bool))) # select the ith component, then add on the DSPs and price cap
+    true_generators = np.concatenate((np.ones(np.sum(array_state_in[:,i]), dtype=bool), np.zeros((2,), dtype=bool))) # + 1 for blackout "generator"
+    model = eqm.update_available_capacities(model, quantity_lessthan_capacity, available_capacities_use, select_gens)
+    
+    return eqm.expected_profits(model, 
+                                demand_lb, 
+                                quantity, 
+                                market_clearing, 
+                                select_gens, 
+                                available_capacities_use[select_gens,:,:], 
+                                production_costs_w_renewable_subsidies[select_gens,:,:], 
+                                production_costs_wo_tax_use[select_gens,:,:], 
+                                participants_use[select_gens], 
+                                participants_int_unique, 
+                                energy_sources_use[select_gens], 
+                                energy_sources_int_unique, 
+                                co2_rates_use[select_gens], 
+                                true_generators, 
+                                ramping_costs_use[select_gens], 
+                                initial_quantities_use[select_gens,:], 
+                                fixed_tariff_component, 
+                                demand_elasticity, 
+                                xis_sample, 
+                                candidate_avg_price, 
+                                num_half_hours, 
+                                sample_weights=cluster_probabilities, 
+                                systemic_blackout_threshold=0.1, 
+                                keep_t_sample=None, 
+                                threshold_eps=0.01, 
+                                max_iter=6, 
+                                intermittent_0mc_sources=intermittent_0mc_sources, 
+                                print_msg=False)
+
+# Run carbon tax counterfactuals
+if running_specification == 2:
+    for index_in_loop_val, idx in enumerate(indices_array):
+        res = compute_eqm(idx, model, demand_lb, quantity, market_clearing, index_in_loop_val=index_in_loop_val)
+        profits[idx,:] = res[0]
+        emissions[idx] = res[1]
+        blackouts[idx] = res[2]
+        frac_by_source[idx,:] = res[3]
+        quantity_weighted_avg_price[idx] = res[4]
+        total_produced[idx] = res[5]
+        misallocated_demand[idx] = res[6]
+        consumer_surplus[idx] = res[7]
+        renewable_production[idx] = res[8]
+        total_production_cost[idx] = res[9]
+        dsp_profits[idx] = res[10]
 
     print(f"Completed the renewable subsidies counterfactual profits in {np.round(time.time() - start_task, 1)} seconds.", flush=True)
 
 # %%
 # Save arrays
+save_args = {
+    'profits': profits[indices_array,:],
+    'emissions': emissions[indices_array],
+    'blackouts': blackouts[indices_array],
+    'frac_by_source': frac_by_source[indices_array,:],
+    'quantity_weighted_avg_price': quantity_weighted_avg_price[indices_array],
+    'total_produced': total_produced[indices_array],
+    'misallocated_demand': misallocated_demand[indices_array],
+    'consumer_surplus': consumer_surplus[indices_array],
+    'renewable_production': renewable_production[indices_array],
+    'total_production_cost': total_production_cost[indices_array], 
+    'dsp_profits': dsp_profits[indices_array]
+}
 if running_specification == 2:
-    np.savez_compressed(f"{gv.arrays_path}counterfactual_env_renewablesubisidies.npz", 
-                        renewable_subsidies_linspace=renewable_subsidies_linspace, 
-                        profits=profits, 
-                        emissions=emissions, 
-                        blackouts=blackouts, 
-                        frac_by_source=frac_by_source, 
-                        quantity_weighted_avg_price=quantity_weighted_avg_price, 
-                        total_produced=total_produced, 
-                        misallocated_demand=misallocated_demand, 
-                        consumer_surplus=consumer_surplus, 
-                        renewable_production=renewable_production, 
-                        total_production_cost=total_production_cost)
+    np.savez_compressed(f"{gv.arrays_path}counterfactual_env_renewablesubisidies_{policy_specification}_{year_specification}_{computation_group_specification}.npz", **save_args)
+
+
+print(f"Everything in this SLURM job is finished!", flush=True)

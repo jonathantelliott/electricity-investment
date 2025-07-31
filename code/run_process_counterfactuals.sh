@@ -4,7 +4,7 @@
 #SBATCH --job-name=process_counterfactuals
 #SBATCH --output=slurm_%j.out
 #SBATCH --error=slurm_%j.err
-#SBATCH --time=00:20:00
+#SBATCH --time=2:00:00
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=10GB

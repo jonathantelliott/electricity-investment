@@ -36,6 +36,27 @@ H = gv.num_intervals_in_day
 
 print(f"Dates processed", flush=True)
 
+# %%
+# Create temperature data
+
+# Import data
+df_temperature = pd.read_csv(gv.temp_data_path + "HM01X_Data_009225_9999999910680996.txt")
+df_temperature.sort_values(by=['Year Month Day Hour Minutes in YYYY', 'MM', 'DD', 'HH24', 'MI format in Local time'], inplace=True)
+
+# Save only dates in the array dates
+df_temperature['date'] = pd.to_datetime(df_temperature[['Year Month Day Hour Minutes in YYYY', 'MM', 'DD']].rename(columns={'Year Month Day Hour Minutes in YYYY': 'year', 'MM': 'month', 'DD': 'day'}))
+df_temperature = df_temperature[df_temperature['date'].isin(dates)]
+
+# Save variables
+df_temperature['Air Temperature in degrees C'] = pd.to_numeric(df_temperature['Air Temperature in degrees C'], errors='coerce')
+df_temperature['Wet bulb temperature in degrees C'] = pd.to_numeric(df_temperature['Wet bulb temperature in degrees C'], errors='coerce')
+air_temps = np.reshape(df_temperature['Air Temperature in degrees C'].values, (T, H))
+wet_bulb_temps = np.reshape(df_temperature['Wet bulb temperature in degrees C'].values, (T, H))
+if save_arrays:
+    np.save(gv.air_temps_file, air_temps)
+    np.save(gv.wet_bulb_temps_file, wet_bulb_temps)
+
+print(f"Temperatures processed", flush=True)
 
 # %%
 # Create facility characteristics
@@ -56,9 +77,9 @@ while yr <= end_year and (month <= end_month or yr < end_year):
     
     # Import month-year bids/offers datafile
     yrmonth_str = str(yr).zfill(4) + "-" + str(month).zfill(2)
-    df_scada[yrmonth_str] = (pd.read_csv(gv.data_path + "facility_scada/facility-scada-" + yrmonth_str + ".csv")
+    df_scada[yrmonth_str] = (pd.read_csv(gv.data_path + "facility_scada/facility-scada-" + yrmonth_str + ".csv", low_memory=False)
                                .sort_values(by=[df_trading_col, df_interval_col, df_participant_col, df_facility_col]))
-    df_stem[yrmonth_str] = (pd.read_csv(gv.data_path + "stem_bids_and_offers/stem-bids-and-offers-" + yrmonth_str + ".csv")
+    df_stem[yrmonth_str] = (pd.read_csv(gv.data_path + "stem_bids_and_offers/stem-bids-and-offers-" + yrmonth_str + ".csv", low_memory=False)
                               .sort_values(by=[df_trading_col, df_interval_col, df_participant_col, df_bid_offer_col, df_stem_price_col]))
     
     # Update month + year
@@ -79,6 +100,8 @@ df_max_gen_col = "Energy Generated (MWh)"
 # Go through the monthly facility SCADA and populate facility arrays
 for key in df_scada:
     # Aggregate by facility, saving the maximum amount generated in a half-hour
+    df_scada[key] = df_scada[key][[df_facility_col, df_participant_col, df_trading_col, df_interval_col, df_max_gen_col]]
+    df_scada[key][df_max_gen_col] = df_scada[key][df_max_gen_col].apply(pd.to_numeric, errors="coerce")
     df_temp = df_scada[key].groupby([df_facility_col, df_participant_col]) \
                            .agg(["max"]) \
                            .reset_index()
@@ -781,7 +804,6 @@ while yr <= end_year and (month <= end_month or yr < end_year):
     dates_in_monthyr = np.arange(np.datetime64(str(yr).zfill(4) + "-" + str(month).zfill(2) + "-" + str(1).zfill(2)),
                                  np.datetime64(str(nextmonth_yr).zfill(4) + "-" + str(nextmonth_month).zfill(2) + "-" + str(1).zfill(2)))
     group = df_scada[yrmonth_str].groupby([df_facility_col, df_trading_col, df_interval_col]).agg("sum").reset_index()
-    # ISSUE: Sometimes the quantity listed is a string that means some quantity - need to deal with this
     mux = pd.MultiIndex.from_product([facilities, np.unique(group[df_trading_col]), range(1, H+1)], names=(df_facility_col,df_trading_col,df_interval_col))
     group = mux.to_frame(index=False).merge(group, on=[df_facility_col, df_trading_col, df_interval_col], how="left").fillna(np.nan) # add the facility codes that are missing, also puts them in correct order
 
@@ -853,7 +875,7 @@ while yr <= end_year:
                             np.datetime64(str(nextmonthyr_yr).zfill(4) + "-" + str(nextmonthyr_month).zfill(2) + "-" + str(1).zfill(2)))
 
     # Ensure that the number of observations is the same as dates x intervals
-    group = df_stem_yr.groupby(['date', df_interval_col]).agg("mean").reset_index() # shouldn't matter, but just in case there are multiple observations
+    group = df_stem_yr[['date', df_interval_col, df_price_col]].groupby(['date', df_interval_col]).agg("mean").reset_index() # shouldn't matter, but just in case there are multiple observations
     mux = pd.MultiIndex.from_product([dates_in_yr, range(1, H+1)], names=('date',df_interval_col))
     group = mux.to_frame(index=False).merge(group, on=['date',df_interval_col], how="left") \
                                      .fillna(np.nan) # add the facility codes that are missing, also puts them in correct order
@@ -873,6 +895,55 @@ if save_arrays:
     np.save(gv.prices_file, prices)
         
 print(f"Prices processed.", flush=True)
+
+# %%
+# Process DSPs
+
+# Import raw data
+df_cap_credits = pd.read_excel(gv.data_loc + "raw_data/wem_data/capacity_credit_assignments/Capacity Credits since market start up to 2023-2024.xlsx", skiprows=lambda x: x < 11)
+df_cap_credits = df_cap_credits.iloc[:,2:] # drop columns A & B
+df_cap_credits = df_cap_credits.loc[:,~df_cap_credits.columns.str.startswith("Unnamed")] # drop columns shouldn't have picked up
+df_cap_credits = df_cap_credits.dropna(how='all') # drop row if all NaN
+df_cap_credits = df_cap_credits[df_cap_credits['Facility name'].notna()]
+
+# Force all values to be floats
+df_cap_credits_columns = df_cap_credits.columns
+df_cap_credits_dates = df_cap_credits_columns[df_cap_credits_columns != "Facility name"] # just the year columns
+for col in df_cap_credits_dates:
+    df_cap_credits[col] = pd.to_numeric(df_cap_credits[col], errors="coerce")
+    
+# Identify just DSPs
+df_cap_credits_dsp = df_cap_credits[df_cap_credits['Facility name'].str.contains("_DSP_")]
+df_cap_credits_dsp = df_cap_credits_dsp.fillna(0.0)
+
+# Create DSP values
+dates_year_capacity = pd.to_datetime(dates).year
+dates_year_capacity = dates_year_capacity - 1 * (pd.to_datetime(dates).month <= 9)
+start_capacity_years, start_capacity_years_counts = np.unique(dates_year_capacity, return_counts=True)
+start_capacity_years_col = np.array([f"{yr}-{str(yr+1)[2:]}" for yr in start_capacity_years])
+df_cap_credits_dsp = df_cap_credits_dsp[df_cap_credits_dsp.columns[np.isin(df_cap_credits_dsp.columns, np.concatenate((np.array(["Facility name"]), start_capacity_years_col)))]]
+dsp_names = np.array([f"{name}" for name in df_cap_credits_dsp['Facility name'].values])
+dsp_quantities = np.repeat(df_cap_credits_dsp[df_cap_credits_dsp.columns[1:]].values, start_capacity_years_counts, axis=1)
+
+# How much DSP dispatched
+dsp_price_start_year = 2012
+dsp_price_end_year = 2022
+df_dsp_prices = pd.concat([pd.read_csv(f"{gv.data_path}demand_side_programme_prices/dsp-decrease-price-{yr}.csv") for yr in np.arange(dsp_price_start_year, dsp_price_end_year + 1)], ignore_index=True)
+df_dsp_prices['Trading Date'] = pd.to_datetime(df_dsp_prices['Trading Date'])
+mux = pd.MultiIndex.from_product([dates, dsp_names], names=('Trading Date', 'Facility Code'))
+df_dsp_prices = mux.to_frame(index=False).merge(df_dsp_prices, on=['Trading Date', 'Facility Code'], how="left").fillna(np.nan)
+dsp_quantity_dispacthed = df_dsp_prices[df_dsp_prices.columns[5:-3]].fillna(0.0).values * np.reshape(dsp_quantities.T, (-1,))[:,np.newaxis]
+dsp_quantity_dispacthed = np.reshape(dsp_quantity_dispacthed, (dsp_quantities.shape[1], dsp_quantities.shape[0], dsp_quantity_dispacthed.shape[1]))
+dsp_quantity_dispacthed = np.sum(dsp_quantity_dispacthed, axis=1)
+
+# Only interested in aggregate quantity
+dsp_quantities = np.sum(dsp_quantities, axis=0) # sum them all up, we're only interested in the aggregate
+
+# Save arrays
+if save_arrays:
+    np.save(gv.dsp_quantities_file, dsp_quantities)
+    np.save(gv.dsp_dispatch_file, dsp_quantity_dispacthed)
+print(f"Demand-side programme data processed.", flush=True)
 
 # %%
 # Process residential tariffs
@@ -928,7 +999,7 @@ while yr <= end_year and (month <= end_month or yr < end_year):
         df_balancing_yr.drop(df_balancing_yr.loc[df_balancing_yr['date'] < np.datetime64(str(start_year) + "-" + str(start_month) + "-01")].index, inplace=True)
 
         # Ensure that the number of observations is the same as dates x intervals
-        group = df_balancing_yr.groupby(['date', df_interval_col]).agg("mean").reset_index() # shouldn't matter, but just in case there are multiple observations
+        group = df_balancing_yr[['date', df_interval_col, df_price_col, df_load_col]].groupby(['date', df_interval_col]).agg("mean").reset_index() # shouldn't matter, but just in case there are multiple observations
         mux = pd.MultiIndex.from_product([dates_in_monthyr, range(1, H+1)], names=('date',df_interval_col))
         group = mux.to_frame(index=False).merge(group, on=['date',df_interval_col], how="left") \
                                          .fillna(np.nan) # add the facility codes that are missing, also puts them in correct order
@@ -1110,24 +1181,12 @@ print(f"Capacity payments processed.", flush=True)
 # %%
 # Process capacity credit assignments
 
-# Import raw data
-df_cap_credits = pd.read_excel(gv.data_loc + "raw_data/wem_data/capacity_credit_assignments/Capacity Credits since market start up to 2023-2024.xlsx", usecols="C:XFD", skiprows=lambda x: x < 11)
-df_cap_credits = df_cap_credits.loc[:,~df_cap_credits.columns.str.startswith("Unnamed")] # drop columns shouldn't have picked up
-df_cap_credits = df_cap_credits.dropna(how='all') # drop row if all NaN
-df_cap_credits = df_cap_credits[df_cap_credits['Facility name'].notna()]
-
-# Force all values to be floats
-df_cap_credits_columns = df_cap_credits.columns
-df_cap_credits_dates = df_cap_credits_columns[df_cap_credits_columns != "Facility name"] # just the year columns
-for col in df_cap_credits_dates:
-    df_cap_credits[col] = pd.to_numeric(df_cap_credits[col], errors="coerce")
-
 df_facilities = pd.DataFrame({'Facility name': facilities})
 df_cap_credits = df_cap_credits.merge(df_facilities, how="right", on="Facility name") # use all of the facilities
 df_cap_credits = df_cap_credits.groupby("Facility name").agg("sum").reset_index() # if facility listed twice, just sum, also turns NaN into 0
 
 # Select just the dates we need
-df_cap_credits_dates = df_cap_credits_dates.astype("U4").astype(int) # just the first year
+df_cap_credits_dates = pd.to_datetime(df_cap_credits_dates, errors='coerce').year
 df_cap_credits_use = np.isin(df_cap_credits_dates, pd.to_datetime(cap_date_from).year) # which years to include
 capacity_commitments = df_cap_credits.values[:,1:][:,df_cap_credits_use]
 
@@ -1162,7 +1221,7 @@ df_price_lims.loc[df_price_lims['Until Date'] == "1/10/11", 'Until Date'] = "1/1
 
 # Convert from and until dates to dates
 max_date = pd.to_datetime(np.max(cap_date_until))
-max_date_str = f"{max_date.day}/{max_date.month}/{max_date.year}"
+max_date_str = f"{max_date.day}/{max_date.month}/{str(max_date.year)[-2:]}"
 df_price_lims[df_price_from_col] = df_price_lims[df_price_from_col].str.replace("TBA", max_date_str)
 df_price_lims[df_price_until_col] = df_price_lims[df_price_until_col].str.replace("TBA", max_date_str)
 df_price_lims[df_price_from_col] = pd.to_datetime(df_price_lims[df_price_from_col], dayfirst=True)
@@ -1283,7 +1342,7 @@ energy_source_replace_dict = {
 for key in energy_source_replace_dict:
     df_eia.loc[df_eia['source'] == key, 'source'] = energy_source_replace_dict[key]
     df_aeta.loc[df_aeta['source'] == key, 'source'] = energy_source_replace_dict[key]
-    
+
 # Expand energy sources to all
 mux = pd.MultiIndex.from_product([np.unique(df_eia['year']), gv.use_sources], names=('year', 'source'))
 df_eia = mux.to_frame(index=False).merge(df_eia, on=['year', 'source'], how="left").fillna(np.nan) # add the sources that are missing, also puts them in correct order
@@ -1293,7 +1352,7 @@ df_aeta = mux.to_frame(index=False).merge(df_aeta, on=['year', 'source'], how="l
 # Construct arrays from data
 capital_costs_us = np.reshape(df_eia['capital_cost_per_kw'].values, (-1,gv.use_sources.shape[0])) # years x energy sources
 capital_costs_wa = np.reshape(df_aeta['capital_cost_per_kw'].values, (-1,gv.use_sources.shape[0]))
-years = np.arange(start_year, end_year)
+years = np.arange(start_year, end_year + 1)
 years = years[np.isin(years, pd.DatetimeIndex(cap_date_from).year)]
 
 # Expand to every year
@@ -1308,11 +1367,6 @@ for y, year in enumerate(years):
     if year in np.reshape(df_aeta['year'].values, (-1,gv.use_sources.shape[0]))[:,0]:
         capital_costs_full_wa[y,:] = capital_costs_wa[ctr_wa,:]
         ctr_wa += 1
-
-# # Interpolate EIA costs
-# for s, source in enumerate(np.reshape(df_eia['source'].values, (-1,gv.use_sources.shape[0]))[0,:]):
-#     interpolate_costs = interp1d(np.reshape(df_eia['year'].values, (-1,gv.use_sources.shape[0]))[:,0], capital_costs_us[:,s], fill_value="extrapolate") # SciPy interpolation to get linear extrapolation
-#     capital_costs_full_us[:,s] = interpolate_costs(years)
 
 # Interpolate EIA costs
 for s, source in enumerate(np.reshape(df_eia['source'].values, (-1,gv.use_sources.shape[0]))[0,:]):
@@ -1334,9 +1388,49 @@ dates_inflation_yr, dates_inflation_yr_idx = np.unique(dates_inflation_yr, retur
 convert_factor_inflation_yr = convert_factor_inflation[dates_inflation_yr_idx]
 capacity_costs = capital_costs_full_wa * convert_factor_inflation_yr[np.isin(dates_inflation_yr, years),np.newaxis]
 
+# Record sources
+capacity_costs_sources = np.reshape(df_eia['source'].values, (-1,gv.use_sources.shape[0]))[0,:]
+
+# Import NREL data
+nrel_data_sheetname = {
+    gv.solar: "Solar - Utility PV", 
+    gv.wind: "Land-Based Wind", 
+    gv.gas_ocgt: "Natural Gas_FE", 
+    gv.gas_ccgt: "Natural Gas_FE", 
+    gv.gas_cogen: "Natural Gas_FE", 
+    gv.coal: "Coal_FE"
+}
+nrel_data_cols = {
+    gv.solar: "M:AP", 
+    gv.wind: "M:AP", 
+    gv.gas_ocgt: "M:AP", 
+    gv.gas_ccgt: "M:AP", 
+    gv.gas_cogen: "M:AP", 
+    gv.coal: "M:AP"
+}
+nrel_data_rows = {
+    gv.solar: [149, 163], 
+    gv.wind: [138, 149], 
+    gv.gas_ocgt: [107, 115], 
+    gv.gas_ccgt: [107, 115], 
+    gv.gas_cogen: [107, 115], 
+    gv.coal: [97, 99]
+}
+df_nrel = {}
+for key in nrel_data_sheetname.keys():
+    df_nrel[key] = pd.read_excel(gv.data_loc + "raw_data/capacity_cost_data/nrel_annual_technology_baseline/2023-ATB-Data_Master_v9.0.xlsx", sheet_name=nrel_data_sheetname[key], usecols=nrel_data_cols[key], skiprows=lambda x: x not in nrel_data_rows[key])
+
+# Add on NREL projections
+nrel_years = np.array(df_nrel[gv.solar].columns)
+nrel_years = nrel_years[nrel_years >= np.max(years)] # only want the last year in the data and the years after
+nrel_vals = np.concatenate(tuple([df_nrel[source][nrel_years].values[0,:][:,np.newaxis] for source in capacity_costs_sources]), axis=1)
+nrel_factors = nrel_vals[1:,:] / nrel_vals[0,:][np.newaxis,:]
+capacity_costs = np.concatenate((capacity_costs, nrel_factors * capacity_costs[-1,:][np.newaxis,:]), axis=0)
+years = np.concatenate((years, nrel_years[1:]))
+
 if save_arrays:
     np.save(gv.capacity_costs_file, capacity_costs)
-    np.save(gv.capacity_costs_sources_file, np.reshape(df_eia['source'].values, (-1,gv.use_sources.shape[0]))[0,:])
+    np.save(gv.capacity_costs_sources_file, capacity_costs_sources)
     np.save(gv.capacity_costs_years_file, years)
         
 print(f"Capacity costs processed.", flush=True)
@@ -1369,11 +1463,22 @@ df_gas = pd.read_excel(gv.commodity_data_path + "2022_Major_Commodities_Resource
                        sheet_name="Petroleum - Dom. Gas - Prices", 
                        usecols="C:E", 
                        skiprows=range(7))
+df_gas.drop(index=20, inplace=True) # this is wrong in the original data, need to just remove
+df_gas.reset_index(drop=True, inplace=True)
 df_gas['month'] = df_gas['Quarter'] * 3
 df_gas.rename(columns={'Year': "year"}, inplace=True)
 df_gas['day'] = 1
 df_gas['date'] = pd.to_datetime(df_gas[['year','month','day']])
-gas_prices = np.interp(pd.to_datetime(dates).values.astype(float), df_gas['date'].values.astype(float), df_gas['A$ per GJ'].values) # interpolate (have the relevant range)
+df_gas_annual = pd.read_excel(gv.commodity_data_path + "2022_Major_Commodities_Resource_Data_File.xlsx", 
+                              sheet_name="Petroleum - Dom. Gas - Prices", 
+                              usecols="I:J", 
+                              skiprows=lambda x: x in range(7) or x > 30)
+df_gas_annual['month'] = 6
+df_gas_annual.rename(columns={'Year.1': "year", 'A$ per GJ.1': "A$ per GJ"}, inplace=True)
+df_gas_annual['day'] = 1
+df_gas_annual['date'] = pd.to_datetime(df_gas_annual[['year','month','day']])
+df_gas = pd.concat([df_gas_annual, df_gas], ignore_index=True)
+gas_prices = np.interp(pd.to_datetime(dates).astype("int64"), pd.to_datetime(df_gas['date'], unit="s").astype("int64") // 10**9, df_gas['A$ per GJ'].values) # interpolate (have the relevant range)
 gas_prices = gas_prices * convert_factor_inflation[np.isin(dates_inflation, dates)]
 
 # Coal prices
@@ -1386,7 +1491,7 @@ df_coal.rename(columns={'Quarter': "date", 'Quantity (Mt)': "quantity (Mt)", 'Va
 df_coal['price (A$/t)'] = (df_coal['value ($ million)'] * 1000000.0) / (df_coal['quantity (Mt)'] * 1000000.0)
 gj_to_tonne_coal = 27.0 # gj / tonne # https://content.ces.ncsu.edu/conversion-factors-for-bioenergy
 df_coal['price (A$/GJ)'] = df_coal['price (A$/t)'] / gj_to_tonne_coal
-coal_prices = np.interp(pd.to_datetime(dates).values.astype(float), df_coal['date'].values.astype(float), df_coal['price (A$/GJ)'].values) # interpolate (have the relevant range)
+coal_prices = np.interp(pd.to_datetime(dates).astype("int64"), pd.to_datetime(df_coal['date'], unit="s").astype("int64") // 10**9, df_coal['price (A$/GJ)'].values) # interpolate (have the relevant range)
 coal_prices = coal_prices * convert_factor_inflation[np.isin(dates_inflation, dates)]
 
 if save_arrays:

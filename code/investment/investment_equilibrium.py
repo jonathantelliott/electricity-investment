@@ -1,11 +1,8 @@
 # %%
 # Import packages
-import numpy as onp # the "OG" numpy that we will need for some indexing functions
-import autograd.numpy as np # autograd's version of numpy
-from autograd.scipy.special import logsumexp
+import numpy as np
+from scipy.special import logsumexp
 from scipy import sparse
-
-from autograd.extend import primitive, defvjp
 
 from itertools import combinations
 
@@ -34,34 +31,6 @@ def n_choose_k_array(array, k):
     combos = combinations(array, k)
     combos_arr = np.array(list(combos), dtype=int)
     return combos_arr
-
-# Define take_along_axis same as numpy.take_along_axis in order to make work with autograd, which does not have the VJP defined for take_along_axis
-def take_along_axis(arr, indices, axis):
-    """
-        Copied over from the original numpy code for numpy.take_along_axis
-    """
-    # normalize inputs
-    if axis is None:
-        arr = arr.flat
-        arr_shape = (len(arr),)  # flatiter has no .shape
-        axis = 0
-    else:
-        axis = onp.core.multiarray.normalize_axis_index(axis, arr.ndim)
-        arr_shape = arr.shape
-
-    # use the fancy index
-    return arr[onp.lib.shape_base._make_along_axis_idx(arr_shape, indices, axis)]
-
-# 
-@primitive
-def nanmax(arr, axis=None, keepdims=onp._NoValue):
-    """
-        Define nanmax using non-autograd numpy
-    """
-    return onp.nanmax(arr, axis=axis, keepdims=keepdims)
-
-# Define the nanmax function using autograd's grad_chooser (same as for max)
-defvjp(nanmax, np.numpy_vjps.grad_chooser)
 
 # %%
 # Define value functions
@@ -206,7 +175,7 @@ def value_fct(firm_payoff, adjustment_cost, indices_unraveled, dims, dims_corres
                     firm_payoff_options = firm_payoff_options - firm_options_adjustment_costs[f'{j}'] # subtract cost of adjusting
                     
                     # Determine probability that firm j adjusts to each state
-                    max_firm_payoff_options = nanmax(firm_payoff_options, axis=1, keepdims=True)
+                    max_firm_payoff_options = np.nanmax(firm_payoff_options, axis=1, keepdims=True)
 #                     print(f"\ti={i}, j={j}, k={firms_combos_ijk}", flush=True)
                     exp_firm_payoff_options = np.exp(firm_payoff_options - max_firm_payoff_options) # subtracting maximum has better numerical properties when numbers are very different
                     policy_fcts = np.nan_to_num(exp_firm_payoff_options / np.sum(np.nan_to_num(exp_firm_payoff_options), axis=1, keepdims=True)) # np.sum(np.nan_to_num(.)) is equivalent to np.nansum, doing it this way b/c autograd doesn't work well with nansum
@@ -228,7 +197,7 @@ def value_fct(firm_payoff, adjustment_cost, indices_unraveled, dims, dims_corres
                     firm_payoff_options = firm_payoff_options - firm_options_adjustment_costs[f'{j}'][:,1:] # subtract cost of adjusting
                     
                     # Determine probability that firm j adjusts to each state
-                    max_firm_payoff_options = nanmax(firm_payoff_options, axis=1, keepdims=True)
+                    max_firm_payoff_options = np.nanmax(firm_payoff_options, axis=1, keepdims=True)
 #                     print(f"\ti={i}, j={j}, k={firms_combos_ijk}", flush=True)
 #                     print(f"\t\tfirm_payoff ({indices_raveled[f'{j}'][0,1:]}, {firm_selection[0,j,-1]}): {firm_payoff_options[0,:]}", flush=True)
                     exp_firm_payoff_options = np.exp(firm_payoff_options - max_firm_payoff_options) # subtracting maximum has better numerical properties when numbers are very different
@@ -257,7 +226,7 @@ def value_fct(firm_payoff, adjustment_cost, indices_unraveled, dims, dims_corres
                     firm_payoff_options = firm_payoff_options - firm_options_adjustment_costs[f'{j}'][:,:2] # subtract cost of adjusting
                 
                     # Determine probability that firm j adjusts to each state
-                    max_firm_payoff_options = nanmax(firm_payoff_options, axis=1, keepdims=True)
+                    max_firm_payoff_options = np.nanmax(firm_payoff_options, axis=1, keepdims=True)
                     exp_firm_payoff_options = np.exp(firm_payoff_options - max_firm_payoff_options) # subtracting maximum has better numerical properties when numbers are very different
                     first_policy_fcts = np.nan_to_num(exp_firm_payoff_options / np.sum(np.nan_to_num(exp_firm_payoff_options), axis=1, keepdims=True)) # np.sum(np.nan_to_num(.)) is equivalent to np.nansum, doing it this way b/c autograd doesn't work well with nansum
                     
@@ -306,7 +275,7 @@ def value_fct(firm_payoff, adjustment_cost, indices_unraveled, dims, dims_corres
                 if firm_selection is None:
                     v_t_dict[f'{firms_combos_ijk_plus_j}'] = v_t_dict[f'{firms_combos_ijk_plus_j}'] + pr_combo * adjusting_firm_onesandzeros[f'{j}'] * v_t_ijk[:,np.newaxis]
                 else: # if the firm in question depends on the state
-                    second_firm_value = prob_first_not_adjust * v_t_ijk_second + (1.0 - prob_first_not_adjust) * take_along_axis(firm_payoff_dict[f'{firms_combos_ijk}'], firm_selection[:,np.arange(firm_selection.shape[1]) == j,-1], axis=1)[:,0][indices_raveled[f'{j}'][:,0]]
+                    second_firm_value = prob_first_not_adjust * v_t_ijk_second + (1.0 - prob_first_not_adjust) * np.take_along_axis(firm_payoff_dict[f'{firms_combos_ijk}'], firm_selection[:,np.arange(firm_selection.shape[1]) == j,-1], axis=1)[:,0][indices_raveled[f'{j}'][:,0]]
                     v_t_ijk_interior = adjusting_firm_onesandzeros[f'{j}'][:,:,0] * v_t_ijk_first[:,np.newaxis] + adjusting_firm_onesandzeros[f'{j}'][:,:,-1] * second_firm_value[:,np.newaxis] # if we are in the interior in the dimension, there is both a first and a second firm
                     v_t_ijk_0 = adjusting_firm_onesandzeros[f'{j}'][:,:,-1] * v_t_ijk_second[:,np.newaxis] # if we are the first state in the dimension, there is no first firm
                     v_t_ijk_m1 = adjusting_firm_onesandzeros[f'{j}'][:,:,0] * v_t_ijk_first[:,np.newaxis] # if we are at the last state in the dimension, there is no second firm
@@ -338,7 +307,7 @@ def value_fct(firm_payoff, adjustment_cost, indices_unraveled, dims, dims_corres
         return v_t_dict, probability_adjustment_dict # only the final ones with the entire list of firms are left
 
 # Determine choice probabilities in each year
-def choice_probabilities(v_t_strategic, v_t_competitive, profits_strategic, profits_competitive, dims, dims_correspondence, adjustment_costs, competitive_firm_selection, row_indices, col_indices, beta, max_T, compute_specific_prob=None, save_probs=False, save_llh_t_i=False, return_sparse_matrix_indexing=False, print_msg=False):
+def choice_probabilities(v_t_strategic, v_t_competitive, profits_strategic, profits_competitive, dims, dims_correspondence, adjustment_costs, competitive_firm_selection, row_indices, col_indices, beta, max_T, compute_specific_prob=None, save_probs=False, save_llh_t_i=False, return_sparse_matrix_indexing=False, strategic_firm_selection=None, print_msg=False, v_t_idx=None):
     """
         Return the value and policy functions for all firms
     
@@ -394,6 +363,9 @@ def choice_probabilities(v_t_strategic, v_t_competitive, profits_strategic, prof
     if save_llh_t_i:
         llh_t_i = []
     
+    if v_t_idx is not None:
+        v_t_extra = []
+    
     # Go through each year, going backward
     for t in range(max_T - 1, -1, -1):
         
@@ -412,7 +384,7 @@ def choice_probabilities(v_t_strategic, v_t_competitive, profits_strategic, prof
         # We took expectation of the strategic firms' payoffs over competitive adjustments while computing the value function, so don't need to do it here
         
         # Determine value and policy functions for the strategic firms
-        res = value_fct(firm_payoff_strategic, adjustment_costs[t,:,:], indices_unraveled, dims, dims_correspondence['strategic'], row_indices['strategic'], col_indices['strategic'], take_expectation=v_t_competitive)
+        res = value_fct(firm_payoff_strategic, adjustment_costs[t,:,:], indices_unraveled, dims, dims_correspondence['strategic'], row_indices['strategic'], col_indices['strategic'], firm_selection=strategic_firm_selection, take_expectation=v_t_competitive)
         combo_of_all_strategic = combo_of_all['strategic']
         v_t_strategic, probability_adjustment_strategic_t, v_t_competitive = res[0][f'{combo_of_all_strategic}'], res[1], res[2][f'{combo_of_all_strategic}']
 #         print(f"v_t_competitive now 2: {v_t_competitive[np.array([0,30]),7]} ", flush=True)
@@ -458,6 +430,10 @@ def choice_probabilities(v_t_strategic, v_t_competitive, profits_strategic, prof
 
         if print_msg:
             print(f"\tfinished iteration t={t} in {np.round(time.time() - start, 2)} seconds.", flush=True)
+
+        if v_t_idx is not None:
+            if (v_t_idx == t) and save_probs:
+                v_t_extra += [v_t_strategic, v_t_competitive]
             
     if print_msg:
         print(f"Completed equilibrium computation.", flush=True)
@@ -474,6 +450,9 @@ def choice_probabilities(v_t_strategic, v_t_competitive, profits_strategic, prof
 
     if save_probs:
         res += [probability_adjustment_dict, v_t_strategic, v_t_competitive]
+
+    if v_t_idx is not None:
+        res += v_t_extra
 
     if return_sparse_matrix_indexing:
         res += [row_indices, col_indices]

@@ -1,13 +1,13 @@
 #!/bin/sh
 #
 #SBATCH --verbose
-#SBATCH --job-name=dynamic_parameters_inference
+#SBATCH --job-name=ancillary_services
 #SBATCH --output=slurm_%j.out
 #SBATCH --error=slurm_%j.err
-#SBATCH --time=6-00:00:00
+#SBATCH --time=00:10:00
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=11
-#SBATCH --mem=650GB
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=5GB
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=jte254@nyu.edu
 
@@ -17,5 +17,5 @@ singularity exec $nv \
     /bin/bash -c "
 source /ext3/env.sh
 export OMP_NUM_THREADS=1
-python ${HOMELOC}code/dynamic_parameters_estimation.py 1 $SLURM_CPUS_PER_TASK > ${SCRATCHLOC}slurm/log_dynamic_parameters_inference.txt
+python ${HOMELOC}code/ancillary_services.py > ${SCRATCHLOC}slurm/log_ancillary_services.txt
 "

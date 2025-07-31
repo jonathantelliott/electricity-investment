@@ -1,16 +1,15 @@
 # %%
 # Import packages
-import autograd.numpy as np
+import numpy as np
 
 import sys
 import itertools
 import time as time
 
 from scipy.optimize import minimize
-from autograd import grad
 from multiprocessing import Pool
 
-import investment.investment_equilibrium as inv_eqm # import investment.investment_equilibrium_knowledgeoforder as inv_eqm
+import investment.investment_equilibrium as inv_eqm
 import global_vars as gv
 
 # %%
@@ -21,48 +20,87 @@ num_cpus = int(sys.argv[2])
 # Import state space variables
 
 # State space description
-loaded = np.load(f"{gv.arrays_path}state_space.npz")
-facilities_unique = np.copy(loaded['facilities_unique'])
-facilities_int = np.copy(loaded['facilities_int'])
-facilities_int_unique = np.copy(loaded['facilities_int_unique'])
-participants_unique = np.copy(loaded['participants_unique'])
-participants_int = np.copy(loaded['participants_int'])
-participants_int_unique = np.copy(loaded['participants_int_unique'])
-energy_sources_unique = np.copy(loaded['energy_sources_unique'])
-energy_sources_int = np.copy(loaded['energy_sources_int'])
-energy_sources_int_unique = np.copy(loaded['energy_sources_int_unique'])
-capacities = np.copy(loaded['capacities'])
-years_unique = np.copy(loaded['years_unique'])
-cap_years = np.copy(loaded['cap_years'])
-array_state_in = np.copy(loaded['array_state_in'])
-state_shape_list = np.copy(loaded['state_shape_list'])
-data_state_idx_start_competitive = np.copy(loaded['data_state_idx_start_competitive'])
-data_state_idx_start_strategic = np.copy(loaded['data_state_idx_start_strategic'])
-data_state_idx_choice_competitive = np.copy(loaded['data_state_idx_choice_competitive'])
-data_state_idx_choice_strategic = np.copy(loaded['data_state_idx_choice_strategic'])
-indices_adjustment_strategic_by_firm = np.copy(loaded['indices_adjustment_strategic_by_firm'])
-indices_adjustment_competitive_by_source = np.copy(loaded['indices_adjustment_competitive_by_source'])
-loaded.close()
+with np.load(f"{gv.arrays_path}state_space.npz") as loaded:
+    facilities_unique = np.copy(loaded['facilities_unique'])
+    facilities_int = np.copy(loaded['facilities_int'])
+    facilities_int_unique = np.copy(loaded['facilities_int_unique'])
+    participants_unique = np.copy(loaded['participants_unique'])
+    participants_int = np.copy(loaded['participants_int'])
+    participants_int_unique = np.copy(loaded['participants_int_unique'])
+    energy_sources_unique = np.copy(loaded['energy_sources_unique'])
+    energy_sources_int = np.copy(loaded['energy_sources_int'])
+    energy_sources_int_unique = np.copy(loaded['energy_sources_int_unique'])
+    capacities = np.copy(loaded['capacities'])
+    years_unique = np.copy(loaded['years_unique'])
+    cap_years = np.copy(loaded['cap_years'])
+    array_state_in = np.copy(loaded['array_state_in'])
+    state_shape_list = np.copy(loaded['state_shape_list'])
+    data_state_idx_start_competitive = np.copy(loaded['data_state_idx_start_competitive'])
+    data_state_idx_start_strategic = np.copy(loaded['data_state_idx_start_strategic'])
+    data_state_idx_choice_competitive = np.copy(loaded['data_state_idx_choice_competitive'])
+    data_state_idx_choice_strategic = np.copy(loaded['data_state_idx_choice_strategic'])
+    indices_adjustment_strategic_by_firm = np.copy(loaded['indices_adjustment_strategic_by_firm'])
+    indices_adjustment_competitive_by_source = np.copy(loaded['indices_adjustment_competitive_by_source'])
 
 # Description of equilibrium at state space
-loaded = np.load(f"{gv.arrays_path}data_env.npz")
-profits = np.copy(loaded['profits']) 
-emissions = np.copy(loaded['emissions']) 
-blackouts = np.copy(loaded['blackouts']) 
-frac_by_source = np.copy(loaded['frac_by_source']) 
-quantity_weighted_avg_price = np.copy(loaded['quantity_weighted_avg_price']) 
-total_produced = np.copy(loaded['total_produced']) 
-misallocated_demand = np.copy(loaded['misallocated_demand']) 
-consumer_surplus = np.copy(loaded['consumer_surplus']) 
-capacity_payments = np.copy(loaded['capacity_payments']) 
-loaded.close()
+carbon_taxes_linspace = np.load(f"{gv.arrays_path}counterfactual_carbon_taxes_linspace.npy")
+renewable_subsidies_linspace = np.load(f"{gv.arrays_path}counterfactual_renewable_subsidies_linspace.npy")
+capacity_payments_linspace = np.load(f"{gv.arrays_path}counterfactual_capacity_payments_linspace.npy")
+years_list = np.load(f"{gv.arrays_path}years_list.npy")[0]
+num_years_in_year_grouping = np.load(f"{gv.arrays_path}num_years_in_year_grouping.npy")[0]
+specification_list_slurm_arrays = np.load(f"{gv.arrays_path}specification_list_slurm_arrays.npy")
+policy_list_slurm_arrays = np.load(f"{gv.arrays_path}policy_list_slurm_arrays.npy")
+year_list_slurm_arrays = np.load(f"{gv.arrays_path}year_list_slurm_arrays.npy")
+computation_group_list_slurm_arrays = np.load(f"{gv.arrays_path}computation_group_list_slurm_arrays.npy")
+
+# Initialize state space variables
+num_agg_years = np.unique(year_list_slurm_arrays).shape[0]
+profits = np.zeros((array_state_in.shape[1], num_agg_years, participants_int_unique.shape[0]))
+emissions = np.zeros((array_state_in.shape[1], num_agg_years))
+blackouts = np.zeros((array_state_in.shape[1], num_agg_years))
+frac_by_source = np.zeros((array_state_in.shape[1], num_agg_years, energy_sources_int_unique.shape[0]))
+quantity_weighted_avg_price = np.zeros((array_state_in.shape[1], num_agg_years))
+total_produced = np.zeros((array_state_in.shape[1], num_agg_years))
+misallocated_demand = np.zeros((array_state_in.shape[1], num_agg_years))
+consumer_surplus = np.zeros((array_state_in.shape[1], num_agg_years))
+capacity_payments = np.zeros((array_state_in.shape[1], cap_years.shape[0], participants_int_unique.shape[0]))
+
+# Fill in from compressed saved arrays
+num_per_group = int(np.floor(array_state_in.shape[1] / np.unique(computation_group_list_slurm_arrays).shape[0]))
+for computation_group_specification_i, computation_group_specification in enumerate(np.unique(computation_group_list_slurm_arrays)):
+    select_group_i = np.arange(array_state_in.shape[1])[computation_group_specification_i*num_per_group:np.minimum(array_state_in.shape[1], (computation_group_specification_i+1)*num_per_group)]
+    for year_specification_i, year_specification in enumerate(np.unique(year_list_slurm_arrays)):
+        with np.load(f"{gv.arrays_path}data_env_{year_specification}_{computation_group_specification}.npz") as loaded:
+            profits[select_group_i,year_specification_i,:] = loaded['profits']
+            emissions[select_group_i,year_specification_i] = loaded['emissions']
+            blackouts[select_group_i,year_specification_i] = loaded['blackouts']
+            frac_by_source[select_group_i,year_specification_i,:] = loaded['frac_by_source']
+            quantity_weighted_avg_price[select_group_i,year_specification_i] = loaded['quantity_weighted_avg_price']
+            total_produced[select_group_i,year_specification_i] = loaded['total_produced']
+            misallocated_demand[select_group_i,year_specification_i] = loaded['misallocated_demand']
+            consumer_surplus[select_group_i,year_specification_i] = loaded['consumer_surplus']
+    with np.load(f"{gv.arrays_path}data_env_cap_payments_{computation_group_specification}.npz") as loaded: # did all years at once for this one
+        capacity_payments[select_group_i,:,:] = loaded['capacity_payments']
+
+# Expand years
+num_repeat_year = np.array([num_years_in_year_grouping] * (years_unique.shape[0] // num_years_in_year_grouping) + [years_unique.shape[0] % num_years_in_year_grouping])
+num_repeat_year = num_repeat_year[num_repeat_year != 0] # if 0 (can happen to last value), drop
+profits = np.repeat(profits, num_repeat_year, axis=1)
+emissions = np.repeat(emissions, num_repeat_year, axis=1)
+blackouts = np.repeat(blackouts, num_repeat_year, axis=1)
+frac_by_source = np.repeat(frac_by_source, num_repeat_year, axis=1)
+quantity_weighted_avg_price = np.repeat(quantity_weighted_avg_price, num_repeat_year, axis=1)
+total_produced = np.repeat(total_produced, num_repeat_year, axis=1)
+misallocated_demand = np.repeat(misallocated_demand, num_repeat_year, axis=1)
+consumer_surplus = np.repeat(consumer_surplus, num_repeat_year, axis=1)
 
 print(f"Finished importing arrays.", flush=True)
 
 # %%
 # Determine dimension correspondences
 strategic_firms = participants_unique[np.array(["c_" not in participant for participant in participants_unique])]
-np.save(f"{gv.arrays_path}strategic_firms_investment.npy", strategic_firms)
+if running_specification == 0:
+    np.save(f"{gv.arrays_path}strategic_firms_investment.npy", strategic_firms)
 num_dims_per_firm = int(state_shape_list.shape[0] / (strategic_firms.shape[0] + 1))
 dims_correspondence_competitive = np.identity(np.sum(state_shape_list[-num_dims_per_firm:] > 1), dtype=bool) # the rows here correspond to energy sources in this case
 dims_correspondence_strategic = np.zeros((strategic_firms.shape[0], state_shape_list.shape[0]), dtype=bool) # initialize
@@ -160,13 +198,15 @@ for i in range(competitive_firm_selection.shape[0]):
         competitive_firm_selection[i,j,0] = participant_int_relevant_competitive_indexing_down
         competitive_firm_selection[i,j,1] = participant_int_relevant_competitive_indexing_up
 
-np.savez_compressed(f"{gv.arrays_path}competitive_firm_selection.npz", competitive_firm_selection=competitive_firm_selection)
+if running_specification == 0:
+    np.savez_compressed(f"{gv.arrays_path}competitive_firm_selection.npz", competitive_firm_selection=competitive_firm_selection)
 print(f"Completed competitive firm selection array.", flush=True)
 
 # %%
 # Determine number of years before no longer able to adjust
 num_years = 30
-np.save(f"{gv.arrays_path}num_years_investment.npy", np.array([num_years]))
+if running_specification == 0:
+    np.save(f"{gv.arrays_path}num_years_investment.npy", np.array([num_years]))
 
 # %%
 # Save state space size
@@ -174,10 +214,11 @@ def create_file(file_name, file_contents):
     f = open(file_name, "w")
     f.write(file_contents)
     f.close()
-    
-create_file(gv.stats_path + "state_space_size_G.tex", f"{profits.shape[0]:,}".replace(",", "\\,"))
-create_file(gv.stats_path + "state_space_size_num_years.tex", f"{num_years:,}".replace(",", "\\,"))
-create_file(gv.stats_path + "state_space_size.tex", f"{profits.shape[0]*num_years:,}".replace(",", "\\,"))
+
+if running_specification == 0:
+    create_file(gv.stats_path + "state_space_size_G.tex", f"{profits.shape[0]:,}".replace(",", "\\,"))
+    create_file(gv.stats_path + "state_space_size_num_years.tex", f"{num_years:,}".replace(",", "\\,"))
+    create_file(gv.stats_path + "state_space_size.tex", f"{profits.shape[0]*num_years:,}".replace(",", "\\,"))
 
 # %%
 # Create array of new generator building costs
@@ -189,7 +230,12 @@ capacity_costs_years = np.load(f"{gv.capacity_costs_years_file}")
 
 # Expand number of years
 capacity_costs_years_expand = np.arange(np.min(capacity_costs_years), np.min(capacity_costs_years) + num_years)
-capacity_costs = np.concatenate((capacity_costs, np.tile(capacity_costs[capacity_costs_years == np.max(capacity_costs_years),:], (num_years - capacity_costs_years.shape[0],1))), axis=0)
+if capacity_costs_years.shape[0] <= capacity_costs_years_expand.shape[0]:
+    capacity_costs = np.concatenate((capacity_costs, np.tile(capacity_costs[capacity_costs_years == np.max(capacity_costs_years),:], (num_years - capacity_costs_years.shape[0],1))), axis=0)
+else:
+    capacity_costs = capacity_costs[:capacity_costs_years_expand.shape[0],:]
+if running_specification == 0:
+    np.save(f"{gv.arrays_path}capacity_costs_expanded_years.npy", capacity_costs)
 
 # Create array with capacity costs based on source of each generator
 per_mw_cost_expand_source = np.zeros((capacity_costs.shape[0], energy_sources_int.shape[0]))
@@ -213,7 +259,19 @@ for t in range(num_years):
     cost_building_new_gens[t,:,:] = cost_building_new_gens_t
 cost_building_new_gens = np.nan_to_num(cost_building_new_gens) # if value is NaN (b/c we exceeded the limit of the dimension), make value 0 (just really need it to be non-NaN, will be multiplied by 0 later in this case)
 
-np.savez_compressed(f"{gv.arrays_path}cost_building_new_gens.npz", cost_building_new_gens=cost_building_new_gens)
+if running_specification == 0:
+    np.savez_compressed(f"{gv.arrays_path}cost_building_new_gens.npz", cost_building_new_gens=cost_building_new_gens)
+
+# Do the same thing for the amount of capacity added
+if running_specification == 0:
+    capacity_all_gens = np.sum(array_state_in * capacities[:,np.newaxis], axis=0) # sum of all generator capacities
+    capacity_new_gens = capacity_all_gens[raveled_state_idx] - capacity_all_gens[:,np.newaxis,np.newaxis]
+    capacity_new_gens = np.maximum(capacity_new_gens, 0.0) # if we are retiring generator, don't want the negative capacity, just 0
+    capacity_new_gens[np.any(unraveled_state_idx >= state_shape_list[state_shape_list > 1][:,np.newaxis,np.newaxis,np.newaxis], axis=0)] = np.nan # replace with NaN if the addition would have resulted in going beyond state space limits
+    capacity_new_gens[np.any(unraveled_state_idx < 0, axis=0)] = np.nan # replace with NaN if the reduction would have resulted in going beyond state space limits
+    capacity_new_gens = np.nan_to_num(capacity_new_gens) # if value is NaN (b/c we exceeded the limit of the dimension), make value 0 (just really need it to be non-NaN, will be multiplied by 0 later in this case)
+    np.savez_compressed(f"{gv.arrays_path}capacity_new_gens.npz", capacity_new_gens=capacity_new_gens)
+    del capacity_all_gens, capacity_new_gens
 
 print(f"Completed creating arrays of investment costs.", flush=True)
 
@@ -221,8 +279,9 @@ print(f"Completed creating arrays of investment costs.", flush=True)
 # Expand profits and capacity payments beyond final year from data
 
 num_years_avg_over = 5
-np.save(f"{gv.arrays_path}num_years_avg_over.npy", np.array([num_years_avg_over]))
-create_file(gv.stats_path + "num_years_avg_over_investment.tex", f"{num_years_avg_over:,}".replace(",", "\\,"))
+if running_specification == 0:
+    np.save(f"{gv.arrays_path}num_years_avg_over.npy", np.array([num_years_avg_over]))
+    create_file(gv.stats_path + "num_years_avg_over_investment.tex", f"{num_years_avg_over:,}".replace(",", "\\,"))
 profits = np.concatenate((profits, np.tile(np.mean(profits[:,-num_years_avg_over:,:], axis=1, keepdims=True), (1,num_years - profits.shape[1],1))), axis=1)
 capacity_payments = np.concatenate((capacity_payments, np.tile(np.mean(capacity_payments[:,-num_years_avg_over:,:], axis=1, keepdims=True), (1,num_years - capacity_payments.shape[1],1))), axis=1)
 select_strategic = np.isin(participants_unique, strategic_firms)
@@ -243,18 +302,20 @@ for i, participant in enumerate(participants_int_unique):
     solar_maintenance[:,i] = np.sum(capacities_in[(participants_int == participant) & np.isin(energy_sources_unique[energy_sources_int], np.array([gv.solar])),:], axis=0)
     wind_maintenance[:,i] = np.sum(capacities_in[(participants_int == participant) & np.isin(energy_sources_unique[energy_sources_int], np.array([gv.wind])),:], axis=0)
 
-np.savez_compressed(f"{gv.arrays_path}maintenance_arrays.npz", 
-                    coal_maintenance=coal_maintenance, 
-                    gas_maintenance=gas_maintenance, 
-                    solar_maintenance=solar_maintenance, 
-                    wind_maintenance=wind_maintenance)
+if running_specification == 0:
+    np.savez_compressed(f"{gv.arrays_path}maintenance_arrays.npz", 
+                        coal_maintenance=coal_maintenance, 
+                        gas_maintenance=gas_maintenance, 
+                        solar_maintenance=solar_maintenance, 
+                        wind_maintenance=wind_maintenance)
 print(f"Completed creating arrays of maintenance obligations.", flush=True)
 
 # %%
 # Set discount factor
 beta = 0.95
-np.save(f"{gv.arrays_path}discount_factor.npy", np.array([beta]))
-create_file(gv.stats_path + "discount_factor.tex", f"{beta:.2}")
+if running_specification == 0:
+    np.save(f"{gv.arrays_path}discount_factor.npy", np.array([beta]))
+    create_file(gv.stats_path + "discount_factor.tex", f"{beta:.2}")
 
 # %%
 # Define likelihood
@@ -262,11 +323,13 @@ create_file(gv.stats_path + "discount_factor.tex", f"{beta:.2}")
 # Adjustment factors (since values are very large and go inside exponentiations)
 adjustment_factor_profits = 1.0 / 1000000000.0
 adjustment_factor_maintenance = 1.0 / 1000.0
-np.savez_compressed(f"{gv.arrays_path}adjustment_factors.npz", adjustment_factor_profits=adjustment_factor_profits, adjustment_factor_maintenance=adjustment_factor_maintenance)
+if running_specification == 0:
+    np.savez_compressed(f"{gv.arrays_path}adjustment_factors.npz", adjustment_factor_profits=adjustment_factor_profits, adjustment_factor_maintenance=adjustment_factor_maintenance)
 
 # Use only the non-trivial dimensions in the state space
 dims = state_shape_list[state_shape_list > 1]
-np.save(f"{gv.arrays_path}dims_investment.npy", dims)
+if running_specification == 0:
+    np.save(f"{gv.arrays_path}dims_investment.npy", dims)
 
 # Create dictionary describing the states in the data
 compute_specific_prob_dict = {
@@ -275,7 +338,8 @@ compute_specific_prob_dict = {
     'competitive_choice_idx': indices_adjustment_competitive_by_source, 
     'strategic_choice_idx': indices_adjustment_strategic_by_firm
 }
-np.savez_compressed(f"{gv.arrays_path}compute_specific_prob_dict.npz", compute_specific_prob_dict=compute_specific_prob_dict)
+if running_specification == 0:
+    np.savez_compressed(f"{gv.arrays_path}compute_specific_prob_dict.npz", compute_specific_prob_dict=compute_specific_prob_dict)
 
 def loglikelihood(theta, print_msg=True, return_time=False, save_llh_t_i=False):
     
@@ -322,30 +386,19 @@ def loglikelihood(theta, print_msg=True, return_time=False, save_llh_t_i=False):
         return -llh_obs[0], time.time() - start
     else:
         return -llh_obs[0]
-    
+
 # %%
 # Estimate parameters
 
 # Initialize parameter guess
-# these are based on a previous iteration that timed out, so starting with them
-theta_profits_init = 0.0#10.0#9.969672890059137
-theta_coal_maintenace_init = 0.0#1.0#1.5180037016140628
-theta_gas_maintenance_init = 0.0#1.0#1.2206927942813188
-theta_solar_maintenance_init = 0.0#1.0#0.6617844084239929
-theta_wind_maintenance_init = 0.0#1.0#0.8485668347702021
+theta_profits_init = 0.0
+theta_coal_maintenace_init = 0.0
+theta_gas_maintenance_init = 0.0
+theta_solar_maintenance_init = 0.0
+theta_wind_maintenance_init = 0.0
 theta_init = np.array([theta_profits_init, theta_coal_maintenace_init, theta_gas_maintenance_init, theta_solar_maintenance_init, theta_wind_maintenance_init])
-# theta_bnds = tuple([(0.0, np.inf) for i in range(theta_init.shape[0])])
 
 # Create gradient function
-def loglikelihood_grad(theta, print_msg=True):
-    start = time.time()
-    grad_eval = grad(loglikelihood)(theta)
-    if print_msg:
-        print(f"gradient w.r.t. argument:\n\ttheta_profits: {grad_eval[0]}\n\ttheta_coal_maintenace: {grad_eval[1]}\n\ttheta_gas_maintenance: {grad_eval[2]}\n\ttheta_solar_maintenance: {grad_eval[3]}\n\ttheta_wind_maintenance: {grad_eval[4]}", flush=True)
-        print(f"Iteration complete in {np.round(time.time() - start, 1)} seconds.\n", flush=True)
-    return grad_eval
-
-# Create numerical gradient function alternative
 deviation_eps = 1.4901161193847656e-08
 def loglikelihood_i(x):
     theta = x[0][0]
@@ -454,14 +507,13 @@ def loglikelihood_wnumericalhess(theta, print_msg=True, save_llh_t_i=False):
 # Estimate theta
 if running_specification == 0:
     # Solve for the parameter that maximizes the likelihood
-    # res = minimize(loglikelihood, theta_init, jac=loglikelihood_grad) # this one takes up too much memory
     res = minimize(loglikelihood_wnumericalgrad, theta_init, jac=True)
     print(f"Optimization result:\n{res}", flush=True)
     thetahat = res.x
 
     # Save results
     np.save(f"{gv.arrays_path}investment_params_est.npy", thetahat)
-    
+
 # %%
 # Determine variance matrix (estimation has to be run first)
 if running_specification == 1:
@@ -506,8 +558,7 @@ if running_specification == 1:
     thetahat_gas_maintenance = adjust_maintenance_costs(thetahat_gas_maintenance)
     thetahat_solar_maintenance = adjust_maintenance_costs(thetahat_solar_maintenance)
     thetahat_wind_maintenance = adjust_maintenance_costs(thetahat_wind_maintenance)
-
-    # need to fix these
+    
     def se_maintenance(theta, loc, Sigma):
         grad_hB = np.zeros(theta.shape[0])
         grad_hB[0] = -theta[loc] * adjustment_factor_maintenance / adjustment_factor_profits / desired_units / theta[0]**2.0
@@ -521,12 +572,12 @@ if running_specification == 1:
     se_wind_maintenance = se_maintenance(thetahat, 4, var)
 
     # Investment costs
-    years = np.array([2007, 2011, 2015, 2019])
-    theta_coal_investment = 1000.0 * capacity_costs[:capacity_costs_years.shape[0],capacity_costs_sources == gv.coal][np.isin(capacity_costs_years,years),0] / desired_units
-    theta_gas_ocgt_investment = 1000.0 * capacity_costs[:capacity_costs_years.shape[0],capacity_costs_sources == gv.gas_ocgt][np.isin(capacity_costs_years,years),0] / desired_units
-    theta_gas_ccgt_investment = 1000.0 * capacity_costs[:capacity_costs_years.shape[0],capacity_costs_sources == gv.gas_ccgt][np.isin(capacity_costs_years,years),0] / desired_units
-    theta_solar_investment = 1000.0 * capacity_costs[:capacity_costs_years.shape[0],capacity_costs_sources == gv.solar][np.isin(capacity_costs_years,years),0] / desired_units
-    theta_wind_investment = 1000.0 * capacity_costs[:capacity_costs_years.shape[0],capacity_costs_sources == gv.wind][np.isin(capacity_costs_years,years),0] / desired_units
+    years = np.array([2006, 2010, 2014, 2018, 2022, 2026, 2030])
+    theta_coal_investment = 1000.0 * capacity_costs[:capacity_costs_years_expand.shape[0],capacity_costs_sources == gv.coal][np.isin(capacity_costs_years_expand,years),0] / desired_units
+    theta_gas_ocgt_investment = 1000.0 * capacity_costs[:capacity_costs_years_expand.shape[0],capacity_costs_sources == gv.gas_ocgt][np.isin(capacity_costs_years_expand,years),0] / desired_units
+    theta_gas_ccgt_investment = 1000.0 * capacity_costs[:capacity_costs_years_expand.shape[0],capacity_costs_sources == gv.gas_ccgt][np.isin(capacity_costs_years_expand,years),0] / desired_units
+    theta_solar_investment = 1000.0 * capacity_costs[:capacity_costs_years_expand.shape[0],capacity_costs_sources == gv.solar][np.isin(capacity_costs_years_expand,years),0] / desired_units
+    theta_wind_investment = 1000.0 * capacity_costs[:capacity_costs_years_expand.shape[0],capacity_costs_sources == gv.wind][np.isin(capacity_costs_years_expand,years),0] / desired_units
 
     thetahat_idiosyncratic_var = 1.0 / (thetahat_profits * adjustment_factor_profits) / desired_units_idiosyncratic
     se_idiosyncratic_var = np.sqrt(var[0,0] * (1.0 / adjustment_factor_profits / desired_units_idiosyncratic / thetahat[0]**2.0)**2.0 / float(num_obs))
@@ -540,18 +591,19 @@ if running_specification == 1:
     tex_table += f"\\cline{{2-2}} \\cline{{4-4}} \\cline{{6-6}} \\cline{{8-8}} \\cline{{10-10}} \\\\ \n"
 
     # Add estimates
-    tex_table += f"\\textit{{Estimates}} & & & & & & & & & \\\\ \n"
+    tex_table += f"\\textit{{Estimated parameters}} & & & & & & & & & \\\\ \n"
     tex_table += f"$\\quad$ maintenace costs & & & & & & & & & \\\\ \n"
     tex_table += f"$\\quad$ $\\quad$ $\\hat{{m}}_{{s}}$ (A\\$/kW) & {thetahat_coal_maintenance:,.1f} & & \\multicolumn{{3}}{{c}}{{{thetahat_gas_maintenance:,.1f}}} & & {thetahat_solar_maintenance:,.1f} & & {thetahat_wind_maintenance:,.1f} \\\\ \n".replace(",", "\\,")
     tex_table += f" & ({se_coal_maintenance:,.1f}) & & \\multicolumn{{3}}{{c}}{{({se_gas_maintenance:,.1f})}} & & ({se_solar_maintenance:,.1f}) & & ({se_wind_maintenance:,.1f}) \\\\ \n".replace(",", "\\,")
     tex_table += f" & & & & & & & & & \\\\ \n"
-    tex_table += f"$\\quad$ average investment costs & & & & & & & & & \\\\ \n"
-    for i in range(years.shape[0]):
-        tex_table += f"$\\quad$ $\\quad$ $\\hat{{C}}_{{s,{years[i]}}}$ (A\\$/kW) & {theta_coal_investment[i]:,.1f} & & {theta_gas_ocgt_investment[i]:,.1f} & & {theta_gas_ccgt_investment[i]:,.1f} & & {theta_solar_investment[i]:,.1f} & & {theta_wind_investment[i]:,.1f} \\\\ \n".replace(",", "\\,")
-    tex_table += f" & & & & & & & & & \\\\ \n"
     tex_table += f"$\\quad$ idiosyncratic shock distribution & & & & & & & \\\\ \n"
     tex_table += f"$\\quad$ $\\quad$ $\\hat{{\\sigma}}_{{\\eta}}$ (million A\\$) & & & & & {thetahat_idiosyncratic_var:,.1f} & & & & \\\\ \n".replace(",", "\\,")
     tex_table += f" & & & & & ({se_idiosyncratic_var:.3f}) & & & & \\\\ \n"
+    tex_table += f" & & & & & & & & & \\\\ \n"
+    tex_table += f"\\textit{{Calibrated parameters}} & & & & & & & & & \\\\ \n"
+    tex_table += f"$\\quad$ investment costs & & & & & & & & & \\\\ \n"
+    for i in range(years.shape[0]):
+        tex_table += f"$\\quad$ $\\quad$ $\\hat{{C}}_{{s,{years[i]}}}$ (A\\$/kW) & {theta_coal_investment[i]:,.1f} & & {theta_gas_ocgt_investment[i]:,.1f} & & {theta_gas_ccgt_investment[i]:,.1f} & & {theta_solar_investment[i]:,.1f} & & {theta_wind_investment[i]:,.1f} \\\\ \n".replace(",", "\\,")
     tex_table += f" & & & & & & & & & \\\\ \n"
 
     # Finish table

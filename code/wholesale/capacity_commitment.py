@@ -65,7 +65,7 @@ def expected_cap_payment(expected_payments_permw_perdollar, capacities, capacity
         capacities : ndarray
             (G,) array of capacities
         capacity_credit_prices : ndarray
-            (T,) array of capacity credit prices
+            (G,T) or (T,) array of capacity credit prices
         participants : ndarray
             (G,) array of firm generator belongs to
         participants_unique : ndarray
@@ -78,10 +78,14 @@ def expected_cap_payment(expected_payments_permw_perdollar, capacities, capacity
     """
     
     # Determine payment
-    payment = expected_payments_permw_perdollar * capacities[:,np.newaxis] * capacity_credit_prices[np.newaxis,:]
+    if capacity_credit_prices.ndim == 1:
+        payment = expected_payments_permw_perdollar * capacities[:,np.newaxis] * capacity_credit_prices[np.newaxis,:]
+    else:
+        payment = expected_payments_permw_perdollar * capacities[:,np.newaxis] * capacity_credit_prices
     
     # Sum by firms
-    cap_payment = np.zeros((capacity_credit_prices.shape[0], participants_unique.shape[0]))
+    T = capacity_credit_prices.shape[0] if capacity_credit_prices.ndim == 1 else capacity_credit_prices.shape[1]
+    cap_payment = np.zeros((T, participants_unique.shape[0]))
     for p, participant in enumerate(participants_unique): # aggregate to firm-level
         cap_payment[:,p] = np.nansum(payment[participants == participant,:], axis=0)
 
